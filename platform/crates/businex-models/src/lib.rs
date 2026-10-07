@@ -15,6 +15,7 @@ pub mod keys;
 pub mod openai;
 pub mod pricing;
 pub mod sse;
+pub mod store;
 pub mod types;
 pub mod urlpolicy;
 
@@ -25,6 +26,7 @@ pub use gemini::GeminiAdapter;
 pub use keys::{KeyError, MasterKey, SealedKey};
 pub use openai::OpenAiAdapter;
 pub use pricing::PricingTable;
+pub use store::{get_budget, release, reserve, set_budget, settle, BudgetRow, DenyReason, StoreError};
 pub use types::{
     compute_cost, Cost, Message, ModelError, ModelRequest, ModelResponse, Price, Role, StreamEvent,
     Usage,
