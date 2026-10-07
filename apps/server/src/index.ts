@@ -4,6 +4,7 @@ import { getDb } from "./db";
 import { attachWebSocket } from "./ws";
 import { killAllTerminals } from "./terminal";
 import { config } from "./config";
+import { redisBridge } from "./lib/redis";
 
 // Touch the database early so schema migrations run before the first request.
 getDb();
@@ -15,10 +16,12 @@ const server = serve({ fetch: app.fetch, hostname: config.host, port: config.por
 });
 
 attachWebSocket(server as any);
+void redisBridge.start();
 
 function shutdown() {
   console.log("[businex] shutting down");
   killAllTerminals();
+  redisBridge.stop();
   process.exit(0);
 }
 process.on("SIGINT", shutdown);

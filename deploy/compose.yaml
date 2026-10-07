@@ -14,7 +14,36 @@ services:
     environment:
       BUSINEX_WEB_ORIGIN: https://app.businex.app
       BUSINEX_REGISTRATION_EMAILS: ${BUSINEX_REGISTRATION_EMAILS:?Set invited account emails}
+      BUSINEX_REDIS_URL: redis://redis:6379
+      BUSINEX_REDIS_PASSWORD_FILE: /run/secrets/redis_password
+    secrets: [redis_password]
+    networks: [default, redis-internal]
+    depends_on:
+      redis:
+        condition: service_healthy
     volumes: [businex-data:/data]
+  redis:
+    image: redis:7.4-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    restart: unless-stopped
+    user: redis
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    secrets: [redis_password]
+    command:
+      - sh
+      - -ec
+      - |
+        umask 077
+        printf 'requirepass %s\n' "$$(cat /run/secrets/redis_password)" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf --save '' --appendonly no --maxmemory 128mb --maxmemory-policy noeviction
+    healthcheck:
+      test: [CMD-SHELL, 'REDISCLI_AUTH="$$(cat /run/secrets/redis_password)" redis-cli ping | grep -q PONG']
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks: [redis-internal]
   tunnel:
     image: cloudflare/cloudflared:latest
     restart: unless-stopped
@@ -29,3 +58,9 @@ services:
         condition: service_healthy
 volumes:
   businex-data:
+secrets:
+  redis_password:
+    file: ${BUSINEX_REDIS_PASSWORD_FILE:?Set path to Redis password file}
+networks:
+  redis-internal:
+    internal: true

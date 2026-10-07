@@ -17,7 +17,7 @@ The smoke test uses a disposable database. Never point it at live customer data.
 
 `deploy/compose.yaml` starts an unprivileged application container and a dedicated Cloudflare Tunnel. The application listens only on host loopback, with no public application port. Provision a Cloudflare Access application for `app.businex.app`, restricted to the invited owner email, before connecting its tunnel or DNS record. Configure the tunnel origin as `http://app:8788`.
 
-Store `BUSINEX_REGISTRATION_EMAILS` and `TUNNEL_TOKEN` in a mode-0600 environment file outside the repository. Do not commit credentials. Use:
+Store `BUSINEX_REGISTRATION_EMAILS`, `TUNNEL_TOKEN`, and `BUSINEX_REDIS_PASSWORD_FILE` in a mode-0600 environment file outside the repository. The last variable points to a separate Redis password file. Compose also starts private, authenticated Redis for shared live notifications; see [Redis setup and boundaries](redis.md). Do not commit credentials. Use:
 
 ```sh
 docker compose --env-file /path/to/private.env -f deploy/compose.yaml up -d --build

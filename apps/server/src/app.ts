@@ -21,6 +21,7 @@ import { analyticsRoutes } from "./routes/analytics";
 import { terminalRoutes } from "./routes/terminal";
 import { mcpRoutes } from "./routes/mcp";
 import { openTagRoutes } from "./routes/opentag";
+import { redisBridge } from "./lib/redis";
 
 export function createApp(): Hono<Env> {
   const app = new Hono<Env>();
@@ -54,6 +55,7 @@ export function createApp(): Hono<Env> {
     name: "businex",
     version: "0.1.0",
     uptime: process.uptime(),
+    redis: redisBridge.status(),
   }));
 
   app.route("/api/auth", authRoutes);

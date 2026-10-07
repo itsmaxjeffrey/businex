@@ -7,10 +7,11 @@ export interface BusinexEvent {
   at: string;
 }
 
-class EventBus extends EventEmitter {
+export class EventBus extends EventEmitter {
   publish(type: string, workspaceId: string, payload: unknown): void {
     const event: BusinexEvent = { type, workspaceId, payload, at: new Date().toISOString() };
     this.emit("event", event);
+    this.emit("publish", event);
   }
 }
 
