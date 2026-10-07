@@ -5,6 +5,7 @@ members = [
   "crates/businex-db",
   "crates/businex-queue",
   "crates/businex-events",
+  "crates/businex-models",
   "crates/businex-api",
   "crates/businex-worker",
 ]
