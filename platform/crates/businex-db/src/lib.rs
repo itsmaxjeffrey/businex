@@ -124,6 +124,14 @@ pub async fn begin_service_tx<'a>(pool: &'a PgPool) -> Result<Transaction<'a, Po
     Ok(tx)
 }
 
+/// Role attribute verification (fail closed) and disposable test databases.
+pub mod verify_roles;
+pub use verify_roles::{
+    current_role_attributes, ensure_api_role_safe, ensure_worker_role_safe,
+    provision_test_roles, role_url, RoleAttributes, TestDb, TEST_APP_PASSWORD,
+    TEST_SERVICE_PASSWORD,
+};
+
 /// Readiness probe: a real round trip to the database.
 pub async fn ping(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT 1").execute(pool).await?;

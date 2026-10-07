@@ -11,9 +11,10 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-07 (runs 1-11, Phase 1 core milestone). Test tally: 52 passing
-(cargo test, /tmp/cargo-test-run11.log): api 5, core 12, rls 4, events 7, queue 17,
-worker 7.
+Last updated: 2026-10-07 (runs 1-19). Test tally: 58 passing (cargo test,
+run18 + repeated run19, both green, zero failures): api 5, identity 3, core 13,
+rls 4, events 7, queue 17, worker 9. Tests run against per-test disposable
+databases on the protected dev stack (dev-test.env).
 
 ## Phase 0 - Inspection, safety, planning
 
@@ -39,8 +40,8 @@ worker 7.
 | T5 | PostgreSQL primary storage | implemented | PostgreSQL 17 (businex-dev stack) as primary storage; SQLx runtime queries; 4 versioned migrations (0001 core/identity/audit, 0002 queue, 0003 files, 0004 lease fencing + role hardening) applied and exercised by the 52-test suite |
 | T6 | Redis for ephemeral cache, rate limits, live events; durable work must not depend on Redis Pub/Sub | implemented | Live events in businex-events (tested, see P0.2). Durable work lives in the PostgreSQL queue only (T16): no queue, schedule or agent state touches Redis. Ephemeral cache and rate-limit uses not yet added |
 | T7 | S3-compatible file and artifact storage | incomplete | Tenant-scoped files metadata table with RLS (migration 0003) is in place; MinIO runs in the dev compose stack. S3 client integration (upload/download paths, artifact storage) not yet implemented |
-| T8 | OIDC-compatible identity plus secure server sessions, local development login | incomplete | |
-| T9 | Company/workspace memberships, RBAC and scoped action permissions for humans, agents and generated apps | incomplete | |
+| T8 | OIDC-compatible identity plus secure server sessions, local development login | implemented | Server sessions (random 256-bit tokens, SHA-256 hashed at rest, HttpOnly SameSite=Strict cookies, revocation, expiry) with Argon2id passwords; local dev registration/login/logout/me (registration gated by config, off by default); verified membership lookup per request. Identity tests: register/login/me/logout flow, wrong-password rejection. OIDC provider integration (discovery, code flow, subject mapping) remains |
+| T9 | Company/workspace memberships, RBAC and scoped action permissions for humans, agents and generated apps | tested | Company creation with atomic owner membership (SECURITY DEFINER function), invitations (single-use, email-bound tokens), role matrix enforced through real API calls. Two-companies/two-roles test proves cross-tenant read/invite denial and viewer/member privilege denial; scoped grants are explicit permission-resource pairs (see R2.6). Audit trail writes on membership actions. Agent action_grants table present; agent/app credential issuance lands with the app platform |
 | T10 | PostgreSQL RLS for tenant records | tested | Migrations enable + FORCE RLS with company-context policies on every tenant table. Tested with the real non-superuser businex_app role (4 tests in businex-db/tests/rls.rs): cross-tenant read/insert/update/delete denied (WITH CHECK rejects foreign rows), pooled connection cannot leak company context between transactions, unset context sees nothing, runtime role cannot SET ROLE businex_service, service role spans tenants by design (BYPASSRLS, asserted in pg_roles). API-request-level enforcement follows in Phase 2 |
 | T11 | Generated backend extensions: TypeScript on Node LTS in isolated containers with resource/time/network limits and scoped API credentials; no host Docker socket, no unrestricted secrets, no direct production DB | incomplete | |
 | T12 | Typed TypeScript app SDK and OpenAPI API contracts | incomplete | |
@@ -90,6 +91,19 @@ worker 7.
 | R6 | Status tracker accuracy: reviewed is distinct from implemented | implemented | This file rewritten with per-row evidence; test tally recorded above |
 | R7 | Mac build host available (Xcode 26.6 via DEVELOPER_DIR), WebKit/Windows remain gates | implemented | Recorded in Known gates below; desktop build targets tracked honestly |
 | R8 | Read and apply all five UI skills before UI work | incomplete | Skills staged in workspace/skills (excluded from commits via .git/info/exclude). Will be read in full before the first UI implementation run (Phase 3) |
+
+## PM review 2 follow-ups (2026-10-07)
+
+| ID | Review requirement | Status | Evidence |
+| --- | --- | --- | --- |
+| S1 | Test isolation: disposable databases or namespaced kinds with cleanup; suite passes repeatedly and under concurrency | tested | Every integration test now provisions its own disposable PostgreSQL database (businex-db TestDb: unique name, migrations applied, dropped on completion and on panic paths). Queue tests additionally namespace kinds per run. Two consecutive full runs green (run18: 58 tests; run19 repeated: 22 test targets ok, zero failures) |
+| S2 | Tests require explicit BUSINEX_TEST_DATABASE_URL; no DATABASE_URL fallback | tested | TestDb refuses to run without BUSINEX_TEST_DATABASE_URL with an explicit message; all test helper fallbacks to DATABASE_URL removed. Tests are run via the protected dev-test.env (sourced, never printed) |
+| S3 | Reconcile contract explicit and compiling | tested | JobHandler::reconcile returns Result<(), HandlerError>: Ok only when the handler resolved the listed effects (then handle runs fresh), error refuses the rerun. Documented in the trait; covered by pending_external_effects_block_blind_retry and the reconciler path test |
+| S4 | Heartbeat stops on all exit paths; lease loss stops handler work before completion/side effects | tested | HeartbeatGuard aborts the heartbeat task on drop (every exit path including early DB errors). Lease loss/cancellation fires a watch channel that drops the handler future: no completion, no external effects afterwards. Tests: lease_loss_stops_handler_before_side_effects (stolen fencing token -> outcome abandoned, zero effects) and cancellation_stops_handler_before_side_effects (outcome canceled, zero effects, lease timestamp frozen) |
+| S5 | Direct behavior evidence for role and queue tests, not only API health | tested | rls.rs (4 tests: catalog attributes, SET ROLE denial, CRUD isolation with real businex_app role, service-role span) and queue/worker suites (17 + 9) exercise behavior directly against the database |
+| S6 | Action-specific grants: read grant must not inherit write/delete from issuer role | tested | Authorization::granted takes explicit ActionGrant permission-resource pairs; empty grants deny all. Test read_grant_does_not_imply_write_even_for_owner issues a read grant under an Owner role and proves write/delete are denied |
+| S7 | Role hardening must verify catalog attributes and fail closed; managed services need explicit provisioning path | implemented | 0004 now raises warnings instead of silent swallowing. businex_db::current_role_attributes reads pg_roles/pg_auth_members; API startup refuses SUPERUSER/BYPASSRLS/service-membership roles, worker startup refuses non-BYPASSRLS/non-service roles. deploy/provision-roles.sql documents the managed-service provisioning path. Tests cover policy refusal cases |
+| S8 | Use dev-test.env for integration tests; never print it | verified | Test runs source /home/coffee/.local/state/businex/dev-test.env (set -a; . file; set +a). The file is never printed and no URL/password appears in command arguments |
 
 ## Known gates and limitations
 

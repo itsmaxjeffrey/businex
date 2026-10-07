@@ -1,6 +1,6 @@
 //! Businex platform API server.
 
-use businex_api::{init_tracing, router, AppState};
+use businex_api::{init_tracing, router, AppConfig, AppState};
 use businex_events::{Relay, RelayOptions};
 use std::time::Instant;
 
@@ -23,6 +23,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(10);
 
     let pool = businex_db::connect(&database_url, max_conn).await?;
+    // Fail closed: verify the runtime role is an ordinary RLS-subject role.
+    let attrs = businex_db::current_role_attributes(&pool).await?;
+    if let Err(reason) = businex_db::ensure_api_role_safe(&attrs) {
+        tracing::error!(role = %attrs.role, "{}", reason);
+        return Err(reason.into());
+    }
+    tracing::info!(role = %attrs.role, "database role verified");
     match std::env::var("BUSINEX_DATABASE_ADMIN_URL") {
         Ok(admin_url) => {
             let admin = businex_db::connect(&admin_url, 2).await?;
@@ -49,10 +56,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     relay.start().await;
 
+    let config = AppConfig {
+        session_ttl_secs: std::env::var("BUSINEX_SESSION_TTL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86_400),
+        // Secure cookies are the default; local development over plain HTTP
+        // must opt out explicitly.
+        cookie_secure: std::env::var("BUSINEX_COOKIE_SECURE")
+            .map(|v| v != "false")
+            .unwrap_or(true),
+        // Development login/registration stays off unless explicitly enabled.
+        dev_login_enabled: std::env::var("BUSINEX_DEV_LOGIN")
+            .map(|v| v == "true")
+            .unwrap_or(false),
+    };
+
     let app = router(AppState {
         pool: pool.clone(),
         relay: relay.clone(),
         started_at: Instant::now(),
+        config,
     });
 
     let addr = format!("{}:{}", host, port);

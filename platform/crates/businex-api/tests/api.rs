@@ -2,32 +2,24 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use businex_api::{router, AppState};
+use businex_api::{router, AppConfig, AppState};
+use businex_db::TestDb;
 use businex_events::{Relay, RelayOptions};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use std::sync::OnceLock;
 use std::time::Instant;
 use tower::ServiceExt;
 
-fn database_url() -> String {
-    std::env::var("BUSINEX_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set BUSINEX_TEST_DATABASE_URL to a disposable PostgreSQL database")
-}
-
-async fn test_state() -> AppState {
-    static MIGRATED: OnceLock<()> = OnceLock::new();
-    let pool = businex_db::connect(&database_url(), 5).await.expect("connect");
-    if MIGRATED.get().is_none() {
-        businex_db::run_migrations(&pool).await.expect("migrate");
-        let _ = MIGRATED.set(());
-    }
-    AppState {
-        pool,
+/// A disposable database per test (requires BUSINEX_TEST_DATABASE_URL).
+async fn test_state() -> (TestDb, AppState) {
+    let db = TestDb::new().await;
+    let state = AppState {
+        pool: db.pool.clone(),
         relay: Relay::new(RelayOptions::default()),
         started_at: Instant::now(),
-    }
+        config: AppConfig::default(),
+    };
+    (db, state)
 }
 
 async fn body_json(resp: axum::response::Response) -> Value {
@@ -39,7 +31,8 @@ async fn body_json(resp: axum::response::Response) -> Value {
 
 #[tokio::test]
 async fn healthz_is_live() {
-    let app = router(test_state().await);
+    let (_db, state) = test_state().await;
+    let app = router(state);
     let resp = app
         .oneshot(
             Request::builder()
@@ -54,7 +47,8 @@ async fn healthz_is_live() {
 
 #[tokio::test]
 async fn readyz_reports_dependencies() {
-    let app = router(test_state().await);
+    let (_db, state) = test_state().await;
+    let app = router(state);
     let resp = app
         .oneshot(
             Request::builder()
@@ -79,6 +73,7 @@ async fn readyz_fails_when_database_is_down() {
         pool: bad_pool,
         relay: Relay::new(RelayOptions::default()),
         started_at: Instant::now(),
+        config: AppConfig::default(),
     });
     let resp = app
         .oneshot(
@@ -94,7 +89,8 @@ async fn readyz_fails_when_database_is_down() {
 
 #[tokio::test]
 async fn api_health_matches_deployment_checks() {
-    let app = router(test_state().await);
+    let (_db, state) = test_state().await;
+    let app = router(state);
     let resp = app
         .oneshot(
             Request::builder()
@@ -113,7 +109,8 @@ async fn api_health_matches_deployment_checks() {
 
 #[tokio::test]
 async fn every_response_carries_a_request_id() {
-    let app = router(test_state().await);
+    let (_db, state) = test_state().await;
+    let app = router(state);
     let resp = app
         .oneshot(
             Request::builder()

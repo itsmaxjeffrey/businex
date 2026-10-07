@@ -3,9 +3,17 @@
 //! Workers claim jobs from the PostgreSQL queue with a lease and a fencing
 //! token, and heartbeat while running. If a worker dies, the lease expires and
 //! another worker retries the job: execution survives process restarts and
-//! client disconnects. A stale attempt (expired lease, or an attempt replaced
-//! by a newer claim even with the same worker id) is fenced out and cannot
-//! complete, fail or refresh the job.
+//! client disconnects.
+//!
+//! Safety rules enforced here:
+//! - The heartbeat task stops on every exit path (guard), including early
+//!   database errors.
+//! - Lease loss or cancellation stops the handler future before any completion
+//!   or external side effect runs: dropping the future is the cancellation.
+//!   A lost lease is never completed by the stale worker; its external effects
+//!   stay pending for reconciliation.
+//! - Stale attempts (expired lease, or a newer claim even by the same worker
+//!   id) are fenced out of complete/fail/heartbeat by the queue.
 
 use async_trait::async_trait;
 use businex_events::Relay;
@@ -15,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HandlerError {
@@ -36,9 +45,12 @@ pub trait JobHandler: Send + Sync {
     /// Called instead of handle() when the job has unresolved external
     /// effects (the previous attempt may have performed them). The default
     /// refuses to run: a blind retry could double a webhook or payment.
-    /// Handlers that can check the external system implement this, resolve
-    /// the effects, and then work proceeds. Pending effects are never
-    /// replayed automatically.
+    ///
+    /// Contract: returns Ok(()) only when the handler has resolved every
+    /// listed effect (typically via ctx.resolve_effect after checking the
+    /// external system); then handle() runs as a fresh attempt. Returning an
+    /// error refuses the rerun. Pending effects are never replayed
+    /// automatically.
     async fn reconcile(&self, ctx: &JobContext, effects: &[JobEffect]) -> Result<(), HandlerError> {
         let _ = (ctx, effects);
         Err(HandlerError::Fatal(
@@ -57,7 +69,7 @@ pub struct JobContext {
 
 impl JobContext {
     /// True once the job is canceled: long-running handlers should check this
-    /// between steps and stop.
+    /// between steps and stop early.
     pub async fn is_canceled(&self) -> Result<bool, QueueError> {
         queue::is_canceled(&self.pool, self.job.id).await
     }
@@ -90,10 +102,27 @@ impl JobContext {
 
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(60);
 
+/// Aborts the heartbeat task on drop, on every exit path.
+struct HeartbeatGuard(Option<JoinHandle<()>>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobReport {
     pub job_id: uuid::Uuid,
     pub outcome: String,
+}
+
+enum Phase {
+    Done(HandlerResult),
+    Stopped,
+    DbError(QueueError),
 }
 
 pub struct Worker {
@@ -168,9 +197,9 @@ impl Worker {
             lost: lost.clone(),
         };
 
-        // Heartbeat task keeps the lease alive while the handler runs. If the
-        // lease is fenced out (expired or superseded) the flag is raised and
-        // the handler can stop early through ctx.lost().
+        // Heartbeat keeps the lease alive and detects lease loss/cancellation.
+        // The guard aborts it on every exit path below, including errors.
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         let hb_pool = self.pool.clone();
         let hb_job = job.clone();
         let hb_lost = lost.clone();
@@ -184,54 +213,98 @@ impl Worker {
                     Ok(true) => {}
                     Ok(false) => {
                         hb_lost.store(true, Ordering::Relaxed);
+                        let _ = stop_tx.send(true);
                         break;
                     }
-                    Err(_) => {}
+                    Err(_) => {} // transient database error: retry next tick
                 }
             }
         });
+        let _heartbeat_guard = HeartbeatGuard(Some(heartbeat));
 
-        let run_result = if queue::is_canceled(&self.pool, job.id).await? {
-            Err(HandlerError::Fatal("canceled".into()))
-        } else {
-            let effects = queue::pending_effects(&self.pool, job.id).await?;
-            if effects.is_empty() {
+        // The handler future is dropped when the stop signal fires: that is
+        // what prevents late completion and late external side effects.
+        let work = async {
+            match queue::is_canceled(&self.pool, job.id).await {
+                Ok(true) => return Phase::Done(Err(HandlerError::Fatal("canceled".into()))),
+                Err(e) => return Phase::DbError(e),
+                Ok(false) => {}
+            }
+            let effects = match queue::pending_effects(&self.pool, job.id).await {
+                Ok(effects) => effects,
+                Err(e) => return Phase::DbError(e),
+            };
+            let outcome = if effects.is_empty() {
                 handler.handle(&ctx).await
             } else {
                 match handler.reconcile(&ctx, &effects).await {
                     Ok(()) => handler.handle(&ctx).await,
                     Err(err) => Err(err),
                 }
-            }
+            };
+            Phase::Done(outcome)
         };
-        heartbeat.abort();
+        tokio::pin!(work);
+        let mut stop = stop_rx.clone();
+        let phase = tokio::select! {
+            res = &mut work => Some(res),
+            _ = async {
+                while !*stop.borrow_and_update() {
+                    if stop.changed().await.is_err() {
+                        break;
+                    }
+                }
+            } => Some(Phase::Stopped),
+        };
+
+        let run_result = match phase.expect("select arms always resolve") {
+            Phase::Done(result) => Some(result),
+            Phase::DbError(err) => return Err(err),
+            Phase::Stopped => None,
+        };
 
         let report = match run_result {
-            Ok(value) => match queue::complete(&self.pool, &ctx.job, value).await {
+            Some(Ok(value)) => match queue::complete(&self.pool, &ctx.job, value).await {
                 Ok(done) => JobReport { job_id: job.id, outcome: done.state },
                 Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
                 Err(err) => return Err(err),
             },
-            Err(HandlerError::Fatal(reason)) if reason == "canceled" => {
+            Some(Err(HandlerError::Fatal(reason))) if reason == "canceled" => {
                 match queue::complete(&self.pool, &ctx.job, Value::Null).await {
                     Ok(done) => JobReport { job_id: job.id, outcome: done.state },
                     Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
                     Err(err) => return Err(err),
                 }
             }
-            Err(HandlerError::Fatal(reason)) => {
+            Some(Err(HandlerError::Fatal(reason))) => {
                 match queue::fail_permanent(&self.pool, &ctx.job, &reason).await {
                     Ok(done) => JobReport { job_id: job.id, outcome: done.state },
                     Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
                     Err(err) => return Err(err),
                 }
             }
-            Err(HandlerError::Retryable(reason)) => {
+            Some(Err(HandlerError::Retryable(reason))) => {
                 let backoff = Duration::from_secs_f64((2f64.powi(job.attempts.min(6))).min(60.0));
                 match queue::fail(&self.pool, &ctx.job, &reason, backoff).await {
                     Ok(done) => JobReport { job_id: job.id, outcome: done.state },
                     Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
                     Err(err) => return Err(err),
+                }
+            }
+            None => {
+                // Stopped mid-run: lease lost or job canceled. A lost lease is
+                // never completed here (the current owner decides); recorded
+                // effects stay pending for reconciliation. A canceled job with
+                // a still-valid lease is closed out as canceled.
+                match queue::is_canceled(&self.pool, job.id).await {
+                    Ok(true) => match queue::complete(&self.pool, &ctx.job, Value::Null).await {
+                        Ok(done) => JobReport { job_id: job.id, outcome: done.state },
+                        Err(QueueError::Fenced) => {
+                            JobReport { job_id: job.id, outcome: "abandoned".into() }
+                        }
+                        Err(err) => return Err(err),
+                    },
+                    _ => JobReport { job_id: job.id, outcome: "abandoned".into() },
                 }
             }
         };

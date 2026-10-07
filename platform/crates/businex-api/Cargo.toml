@@ -9,7 +9,11 @@ name = "businex-api"
 path = "src/main.rs"
 
 [dependencies]
+argon2 = "0.5"
 axum.workspace = true
+hex.workspace = true
+rand.workspace = true
+sha2.workspace = true
 businex-core.workspace = true
 businex-db.workspace = true
 businex-events.workspace = true
@@ -18,6 +22,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true

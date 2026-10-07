@@ -1,79 +1,17 @@
 //! Row level security tests with the real least-privilege runtime role.
 //!
-//! These tests provision login passwords for the businex_app and
-//! businex_service roles over the admin connection (test-only credentials),
-//! then connect as those roles: businex_app is an ordinary non-superuser and
-//! RLS must contain it; businex_service is the worker role. The API runtime
-//! must not be superuser and must not be able to assume the service role.
+//! Every test gets its own disposable database (TestDb) and connects as the
+//! provisioned businex_app / businex_service roles: businex_app is an ordinary
+//! non-superuser and RLS must contain it; businex_service is the worker role.
+//! The API runtime must not be superuser and must not be able to assume the
+//! service role.
 
-use businex_db::{begin_company_tx, begin_company_tx_on, CompanyContext};
+use businex_db::{
+    begin_company_tx, begin_company_tx_on, current_role_attributes, ensure_api_role_safe,
+    ensure_worker_role_safe, CompanyContext, TestDb, TEST_APP_PASSWORD, TEST_SERVICE_PASSWORD,
+};
 use sqlx::{Connection, Row};
 use uuid::Uuid;
-
-const APP_PASSWORD: &str = "businex-app-test-pw";
-const SERVICE_PASSWORD: &str = "businex-service-test-pw";
-
-fn admin_url() -> String {
-    std::env::var("BUSINEX_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set BUSINEX_TEST_DATABASE_URL to a disposable PostgreSQL database")
-}
-
-/// Swap the user info of a postgres URL for another role.
-fn role_url(admin: &str, user: &str, password: &str) -> String {
-    let scheme_end = admin.find("://").expect("scheme") + 3;
-    let at = admin.rfind('@').expect("user info");
-    format!(
-        "{}{}:{}@{}",
-        &admin[..scheme_end],
-        user,
-        password,
-        &admin[at + 1..]
-    )
-}
-
-static SETUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
-
-async fn setup() {
-    SETUP
-        .get_or_init(|| async {
-            let admin = businex_db::connect(&admin_url(), 4).await.expect("admin connect");
-            businex_db::run_migrations(&admin).await.expect("migrate");
-            // Provision test-only login passwords. Production provisioning does
-            // this out of band; passwords never live in the repository. This
-            // runs exactly once: parallel ALTER ROLE on pg_authid conflicts.
-            for (role, password) in [
-                ("businex_app", APP_PASSWORD),
-                ("businex_service", SERVICE_PASSWORD),
-            ] {
-                sqlx::query(&format!(
-                    "ALTER ROLE {} LOGIN PASSWORD '{}'",
-                    role, password
-                ))
-                .execute(&admin)
-                .await
-                .expect("provision role login");
-            }
-        })
-        .await;
-}
-
-async fn app_pool() -> sqlx::PgPool {
-    setup().await;
-    businex_db::connect(&role_url(&admin_url(), "businex_app", APP_PASSWORD), 4)
-        .await
-        .expect("app role connect")
-}
-
-async fn service_pool() -> sqlx::PgPool {
-    setup().await;
-    businex_db::connect(
-        &role_url(&admin_url(), "businex_service", SERVICE_PASSWORD),
-        4,
-    )
-    .await
-    .expect("service role connect")
-}
 
 async fn new_company(pool: &sqlx::PgPool, name: &str) -> Uuid {
     let id = Uuid::new_v4();
@@ -89,12 +27,31 @@ async fn new_company(pool: &sqlx::PgPool, name: &str) -> Uuid {
 
 #[tokio::test]
 async fn role_attributes_match_documented_behavior() {
-    setup().await;
-    let admin = businex_db::connect(&admin_url(), 2).await.expect("admin");
+    let db = TestDb::new().await;
+    let admin = &db.pool;
+
+    // Runtime role: ordinary login role subject to RLS.
+    let app = db.role_pool("businex_app", TEST_APP_PASSWORD).await;
+    let attrs = current_role_attributes(&app).await.expect("attrs");
+    assert_eq!(attrs.role, "businex_app");
+    assert!(!attrs.superuser, "runtime role must not be superuser");
+    assert!(!attrs.bypassrls, "runtime role must be subject to RLS");
+    assert!(!attrs.member_of_service, "runtime role must not join businex_service");
+    ensure_api_role_safe(&attrs).expect("api role policy");
+
+    // Service role: workers span tenants by design, but never superuser.
+    let service = db.role_pool("businex_service", TEST_SERVICE_PASSWORD).await;
+    let sattrs = current_role_attributes(&service).await.expect("attrs");
+    assert_eq!(sattrs.role, "businex_service");
+    assert!(!sattrs.superuser, "service role must not be superuser");
+    assert!(sattrs.bypassrls, "service role must bypass RLS as documented");
+    ensure_worker_role_safe(&sattrs).expect("worker role policy");
+
+    // The catalog must show exactly these attributes (fail closed claim).
     let rows = sqlx::query(
         "SELECT rolname, rolsuper, rolbypassrls FROM pg_roles WHERE rolname IN ('businex_app','businex_service')",
     )
-    .fetch_all(&admin)
+    .fetch_all(admin)
     .await
     .expect("role lookup");
     let attr = |name: &str| {
@@ -102,36 +59,28 @@ async fn role_attributes_match_documented_behavior() {
             .find(|r| r.get::<String, _>("rolname") == name)
             .unwrap_or_else(|| panic!("role {} must exist", name))
     };
-    let app = attr("businex_app");
-    assert!(!app.get::<bool, _>("rolsuper"), "runtime role must not be superuser");
-    assert!(!app.get::<bool, _>("rolbypassrls"), "runtime role must be subject to RLS");
-    let svc = attr("businex_service");
-    assert!(!svc.get::<bool, _>("rolsuper"), "service role must not be superuser");
-    assert!(
-        svc.get::<bool, _>("rolbypassrls"),
-        "service role must bypass RLS as documented (workers process all tenants)"
-    );
+    assert!(!attr("businex_app").get::<bool, _>("rolbypassrls"));
+    assert!(attr("businex_service").get::<bool, _>("rolbypassrls"));
 
-    // The runtime role must not be able to assume the service role.
-    let members = sqlx::query(
-        "SELECT count(*) AS n FROM pg_auth_members m
-         JOIN pg_roles r ON r.oid = m.roleid
-         JOIN pg_roles g ON g.oid = m.member
-         WHERE g.rolname = 'businex_app' AND r.rolname = 'businex_service'",
-    )
-    .fetch_one(&admin)
-    .await
-    .expect("membership lookup");
-    assert_eq!(
-        members.get::<i64, _>("n"),
-        0,
-        "businex_app must not be a member of businex_service"
+    // Policy checks fail closed on violations.
+    let mut bad = sattrs.clone();
+    bad.superuser = true;
+    assert!(ensure_worker_role_safe(&bad).is_err(), "superuser worker must be refused");
+    let mut bad_api = attrs.clone();
+    bad_api.bypassrls = true;
+    assert!(ensure_api_role_safe(&bad_api).is_err(), "BYPASSRLS api role must be refused");
+    let mut bad_member = attrs.clone();
+    bad_member.member_of_service = true;
+    assert!(
+        ensure_api_role_safe(&bad_member).is_err(),
+        "api role in businex_service must be refused"
     );
 }
 
 #[tokio::test]
 async fn runtime_role_cannot_assume_service_role() {
-    let app = app_pool().await;
+    let db = TestDb::new().await;
+    let app = db.role_pool("businex_app", TEST_APP_PASSWORD).await;
     let mut conn = app.acquire().await.expect("conn");
     let mut tx = conn.begin().await.expect("tx");
     let result = sqlx::query("SET LOCAL ROLE businex_service")
@@ -146,10 +95,11 @@ async fn runtime_role_cannot_assume_service_role() {
 
 #[tokio::test]
 async fn tenant_isolation_for_read_insert_update_delete() {
-    let admin = businex_db::connect(&admin_url(), 4).await.expect("admin");
-    let app = app_pool().await;
-    let company_a = new_company(&admin, "RLS Company A").await;
-    let company_b = new_company(&admin, "RLS Company B").await;
+    let db = TestDb::new().await;
+    let admin = &db.pool;
+    let app = db.role_pool("businex_app", TEST_APP_PASSWORD).await;
+    let company_a = new_company(admin, "RLS Company A").await;
+    let company_b = new_company(admin, "RLS Company B").await;
 
     // Reads: each company sees only itself.
     let mut tx_a = begin_company_tx(&app, CompanyContext::new(company_a))
@@ -202,7 +152,7 @@ async fn tenant_isolation_for_read_insert_update_delete() {
     )
     .bind(audit_b)
     .bind(company_b)
-    .execute(&admin)
+    .execute(admin)
     .await
     .expect("admin insert b");
 
@@ -268,10 +218,11 @@ async fn tenant_isolation_for_read_insert_update_delete() {
 
 #[tokio::test]
 async fn service_role_processes_all_tenants() {
-    let admin = businex_db::connect(&admin_url(), 4).await.expect("admin");
-    let service = service_pool().await;
-    let company_a = new_company(&admin, "Service Co A").await;
-    let company_b = new_company(&admin, "Service Co B").await;
+    let db = TestDb::new().await;
+    let admin = &db.pool;
+    let service = db.role_pool("businex_service", TEST_SERVICE_PASSWORD).await;
+    let company_a = new_company(admin, "Service Co A").await;
+    let company_b = new_company(admin, "Service Co B").await;
 
     // Workers legitimately see every tenant's jobs (documented BYPASSRLS).
     let n = sqlx::query("SELECT count(*) AS n FROM companies WHERE id = ANY($1)")

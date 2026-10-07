@@ -16,13 +16,36 @@ use std::time::Instant;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 
+pub mod auth;
+mod routes_identity;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Runtime configuration. Session cookies are HttpOnly + SameSite=Strict and
+/// Secure outside explicit local development.
+#[derive(Debug, Clone)]
+pub struct AppConfig {
+    pub session_ttl_secs: i64,
+    pub cookie_secure: bool,
+    pub dev_login_enabled: bool,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            session_ttl_secs: 86_400,
+            cookie_secure: true,
+            dev_login_enabled: false,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub relay: Relay,
     pub started_at: Instant,
+    pub config: AppConfig,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -31,6 +54,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/api/health", get(api_health))
+        .merge(routes_identity::router())
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
         .layer(SetRequestIdLayer::new(

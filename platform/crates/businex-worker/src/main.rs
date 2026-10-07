@@ -12,6 +12,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let database_url = std::env::var("BUSINEX_WORKER_DATABASE_URL")
         .expect("BUSINEX_WORKER_DATABASE_URL is required (service role)");
     let pool = businex_db::connect(&database_url, 5).await?;
+    // Fail closed: workers must run as the documented service role.
+    let attrs = businex_db::current_role_attributes(&pool).await?;
+    if let Err(reason) = businex_db::ensure_worker_role_safe(&attrs) {
+        tracing::error!(role = %attrs.role, "{}", reason);
+        return Err(reason.into());
+    }
+    tracing::info!(role = %attrs.role, "database role verified");
     match std::env::var("BUSINEX_DATABASE_ADMIN_URL") {
         Ok(admin_url) => {
             let admin = businex_db::connect(&admin_url, 2).await?;

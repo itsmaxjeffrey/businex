@@ -220,17 +220,36 @@ pub enum Actor {
     System,
 }
 
-/// Resource scope for scoped action grants (agents, generated apps).
+/// One explicit permission-resource grant for a scoped credential (agent or
+/// generated app). The pair is the unit of trust: a grant to read a resource
+/// never implies writing it, regardless of the issuing role.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActionGrant {
+    pub permission: Permission,
+    pub resource: String,
+}
+
+impl ActionGrant {
+    pub fn new(permission: Permission, resource: impl Into<String>) -> Self {
+        ActionGrant {
+            permission,
+            resource: resource.into(),
+        }
+    }
+}
+
+/// Resource scope for authorization decisions.
 ///
 /// Unrestricted access is the explicit variant All and exists only after an
 /// authorized grant decision (a verified human membership). Scoped
-/// credentials are Restricted: an empty or malformed grant list means deny
-/// everything. There is no "empty means everything" interpretation.
+/// credentials carry explicit ActionGrant pairs: an empty or malformed grant
+/// list means deny everything. There is no "empty means everything"
+/// interpretation and no inheritance of actions from the issuer's role.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
 pub enum ResourceScope {
     All,
-    Restricted { resources: Vec<String> },
+    Actions { grants: Vec<ActionGrant> },
 }
 
 impl ResourceScope {
@@ -239,25 +258,27 @@ impl ResourceScope {
         ResourceScope::All
     }
 
-    /// A scoped grant. An empty list denies all resources.
-    pub fn restricted(resources: Vec<String>) -> Self {
-        ResourceScope::Restricted { resources }
+    /// Explicit permission-resource grants. An empty list denies everything.
+    pub fn actions(grants: Vec<ActionGrant>) -> Self {
+        ResourceScope::Actions { grants }
     }
 
-    pub fn allows(&self, resource: &str) -> bool {
+    /// A grant allows exactly the action on the resource (or the wildcard
+    /// resource "*"). Nothing else is implied.
+    pub fn allows(&self, action: Permission, resource: &str) -> bool {
         match self {
             ResourceScope::All => true,
-            ResourceScope::Restricted { resources } => {
-                resources.iter().any(|r| r == resource)
-            }
+            ResourceScope::Actions { grants } => grants.iter().any(|g| {
+                g.permission == action && (g.resource == "*" || g.resource == resource)
+            }),
         }
     }
 }
 
 impl Default for ResourceScope {
     fn default() -> Self {
-        // Deny by default: scoped credentials must list resources explicitly.
-        ResourceScope::Restricted { resources: vec![] }
+        // Deny by default: scoped credentials must list grants explicitly.
+        ResourceScope::Actions { grants: vec![] }
     }
 }
 
@@ -285,19 +306,20 @@ impl Authorization {
         }
     }
 
-    /// Scoped action grant for an agent or generated app: role permissions
-    /// narrowed to the listed resources. Empty resources deny everything.
+    /// Scoped credential for an agent or generated app: exactly the listed
+    /// permission-resource grants, bounded above by the role. An owner-issued
+    /// read grant confers read only; empty grants deny everything.
     pub fn granted(
         actor: Actor,
         company_id: uuid::Uuid,
         role: Role,
-        resources: Vec<String>,
+        grants: Vec<ActionGrant>,
     ) -> Self {
         Authorization {
             actor,
             company_id,
             role,
-            scope: ResourceScope::restricted(resources),
+            scope: ResourceScope::actions(grants),
         }
     }
 
@@ -310,10 +332,10 @@ impl Authorization {
                 reason: format!("role {} does not grant {}", self.role, action.as_str()),
             });
         }
-        if !self.scope.allows(resource) {
+        if !self.scope.allows(action, resource) {
             return Err(Error::Forbidden {
                 action: action.as_str().to_string(),
-                reason: format!("resource {} is out of scope", resource),
+                reason: format!("no grant for {} on {}", action.as_str(), resource),
             });
         }
         Ok(())
@@ -437,14 +459,34 @@ mod tests {
     }
 
     #[test]
-    fn scoped_grant_narrows_role_and_resources() {
+    fn read_grant_does_not_imply_write_even_for_owner() {
+        // The issuer is an owner, the credential gets one read grant: it must
+        // not be able to write, update or delete anything.
+        let auth = Authorization::granted(
+            Actor::GeneratedApp { app_id: Uuid::new_v4(), install_id: Uuid::new_v4() },
+            Uuid::new_v4(),
+            Role::Owner,
+            vec![ActionGrant::new(Permission::RecordsRead, "app:inventory")],
+        );
+        assert!(auth.check(Permission::RecordsRead, "app:inventory").is_ok());
+        assert!(auth.check(Permission::RecordsWrite, "app:inventory").is_err());
+        assert!(auth.check(Permission::RecordsDelete, "app:inventory").is_err());
+        assert!(auth.check(Permission::RecordsRead, "app:other").is_err());
+    }
+
+    #[test]
+    fn scoped_grants_narrow_role_and_resources() {
         let auth = Authorization::granted(
             Actor::GeneratedApp { app_id: Uuid::new_v4(), install_id: Uuid::new_v4() },
             Uuid::new_v4(),
             Role::Manager,
-            vec!["app:inventory".into()],
+            vec![
+                ActionGrant::new(Permission::RecordsWrite, "app:inventory"),
+                ActionGrant::new(Permission::RecordsRead, "app:inventory"),
+            ],
         );
         assert!(auth.check(Permission::RecordsWrite, "app:inventory").is_ok());
+        assert!(auth.check(Permission::RecordsRead, "app:inventory").is_ok());
         assert!(auth.check(Permission::RecordsWrite, "app:other").is_err());
         // The role boundary still applies inside the scope.
         assert!(auth.check(Permission::MembersManage, "app:inventory").is_err());
@@ -454,12 +496,16 @@ mod tests {
     fn scope_serializes_explicitly_and_rejects_unknown_modes() {
         let all = serde_json::to_string(&ResourceScope::all()).unwrap();
         assert_eq!(all, "{\"mode\":\"all\"}");
-        let restricted =
-            serde_json::to_string(&ResourceScope::restricted(vec!["app:inventory".into()])).unwrap();
-        assert_eq!(restricted, "{\"mode\":\"restricted\",\"resources\":[\"app:inventory\"]}");
+        let scoped = serde_json::to_string(&ResourceScope::actions(vec![ActionGrant::new(
+            Permission::RecordsRead,
+            "app:inventory",
+        )]))
+        .unwrap();
+        assert!(scoped.contains("\"mode\":\"actions\""));
+        assert!(scoped.contains("records.read"));
         assert!(serde_json::from_str::<ResourceScope>("{\"mode\":\"wat\"}").is_err());
-        // Empty restricted list is deny-all, not allow-all.
-        let empty: ResourceScope = serde_json::from_str("{\"mode\":\"restricted\",\"resources\":[]}").unwrap();
-        assert!(!empty.allows("anything"));
+        // Empty grants deny all actions, not allow all.
+        let empty = ResourceScope::actions(vec![]);
+        assert!(!empty.allows(Permission::RecordsRead, "anything"));
     }
 }

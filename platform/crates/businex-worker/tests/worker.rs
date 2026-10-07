@@ -2,29 +2,21 @@
 //! prevention, bounded retries, cancellation and uncertain outcomes.
 
 use async_trait::async_trait;
+use businex_db::TestDb;
 use businex_events::{Relay, RelayOptions};
 use businex_queue::{enqueue, EnqueueOutcome, NewJob, JobState};
 use businex_worker::{HandlerError, JobContext, JobHandler, Worker};
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
-fn database_url() -> String {
-    std::env::var("BUSINEX_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set BUSINEX_TEST_DATABASE_URL to a disposable PostgreSQL database")
-}
-
-async fn test_pool() -> PgPool {
-    static MIGRATED: OnceLock<()> = OnceLock::new();
-    let pool = businex_db::connect(&database_url(), 8).await.expect("connect");
-    if MIGRATED.get().is_none() {
-        businex_db::run_migrations(&pool).await.expect("migrate");
-        let _ = MIGRATED.set(());
-    }
-    pool
+/// A disposable database per test (requires BUSINEX_TEST_DATABASE_URL).
+async fn test_pool() -> (TestDb, PgPool) {
+    let db = TestDb::new().await;
+    let pool = db.pool.clone();
+    (db, pool)
 }
 
 async fn new_company(pool: &PgPool) -> uuid::Uuid {
@@ -77,7 +69,7 @@ fn worker_with(pool: PgPool, kind: &str, handler: Arc<CountingHandler>) -> Worke
 
 #[tokio::test]
 async fn run_once_executes_handler_and_completes() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     enqueue(&pool, NewJob::new(Some(company), "t1", json!({})))
         .await
@@ -106,7 +98,7 @@ async fn run_once_executes_handler_and_completes() {
 
 #[tokio::test]
 async fn duplicate_enqueue_never_runs_twice() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let key = format!("run-{}", uuid::Uuid::new_v4());
     for _ in 0..3 {
@@ -134,7 +126,7 @@ async fn duplicate_enqueue_never_runs_twice() {
 
 #[tokio::test]
 async fn crash_before_completion_is_recovered_exactly_once() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let job = match enqueue(&pool, NewJob::new(Some(company), "t3", json!({})))
         .await
@@ -171,7 +163,7 @@ async fn crash_before_completion_is_recovered_exactly_once() {
 
 #[tokio::test]
 async fn retryable_errors_requeue_then_succeed() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     enqueue(&pool, NewJob::new(Some(company), "t4", json!({})))
         .await
@@ -200,7 +192,7 @@ async fn retryable_errors_requeue_then_succeed() {
 
 #[tokio::test]
 async fn fatal_errors_fail_without_retry() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     enqueue(&pool, NewJob::new(Some(company), "t5", json!({})))
         .await
@@ -223,7 +215,7 @@ async fn fatal_errors_fail_without_retry() {
 
 #[tokio::test]
 async fn canceled_jobs_never_execute() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let job = match enqueue(&pool, NewJob::new(Some(company), "t6", json!({})))
         .await
@@ -279,7 +271,7 @@ impl JobHandler for Reconciler {
 
 #[tokio::test]
 async fn pending_external_effects_block_blind_retry() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let job = match enqueue(&pool, NewJob::new(Some(company), "t7", json!({})))
         .await
@@ -348,3 +340,168 @@ async fn pending_external_effects_block_blind_retry() {
     assert_eq!(report2.outcome, "succeeded");
     assert_eq!(runs2.load(Ordering::SeqCst), 1);
 }
+
+
+// ---------------------------------------------------------------------------
+// Lease loss and cancellation must stop handler work before side effects.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::AtomicBool;
+
+/// Handler that starts, then would record an external effect only after a long
+/// sleep. If stopping works, the effect is never recorded.
+struct SlowHandler {
+    started: Arc<AtomicBool>,
+    effect_written: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl JobHandler for SlowHandler {
+    async fn handle(&self, ctx: &JobContext) -> businex_worker::HandlerResult {
+        self.started.store(true, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        // The stale work path: side effect first, then success.
+        ctx.record_effect("call:external", "sha256:slow")
+            .await
+            .expect("record effect");
+        self.effect_written.store(true, Ordering::SeqCst);
+        Ok(json!({"late": true}))
+    }
+}
+
+async fn wait_for(flag: &AtomicBool) {
+    for _ in 0..500 {
+        if flag.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("handler did not start in time");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lease_loss_stops_handler_before_side_effects() {
+    let (_db, pool) = test_pool().await;
+    let company = new_company(&pool).await;
+    let kind = format!("slow-loss-{}", uuid::Uuid::new_v4());
+    let job = match enqueue(&pool, NewJob::new(Some(company), kind.clone(), json!({})))
+        .await
+        .expect("enqueue")
+    {
+        EnqueueOutcome::Enqueued(j) => j,
+        _ => panic!("expected new job"),
+    };
+
+    let started = Arc::new(AtomicBool::new(false));
+    let effect_written = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(SlowHandler {
+        started: started.clone(),
+        effect_written: effect_written.clone(),
+    });
+    let mut worker = Worker::new(pool.clone(), Relay::new(RelayOptions::default()))
+        .with_lease(Duration::from_secs(30))
+        .with_poll_interval(Duration::from_millis(10));
+    worker.register(kind.clone(), handler);
+
+    let run = tokio::spawn(async move { worker.run_once().await });
+    wait_for(&started).await;
+
+    // Another worker takes over: the lease token is replaced behind our back,
+    // exactly like a reclaim + re-claim by a different attempt.
+    sqlx::query("UPDATE jobs SET lease_token = gen_random_uuid() WHERE id = $1")
+        .bind(job.id)
+        .execute(&pool)
+        .await
+        .expect("steal lease");
+
+    let report = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("worker must notice lease loss quickly")
+        .expect("join")
+        .expect("cycle")
+        .expect("job ran");
+    assert_eq!(report.outcome, "abandoned", "stolen lease must abandon the attempt");
+    assert!(
+        !effect_written.load(Ordering::SeqCst),
+        "handler side effects must not run after lease loss"
+    );
+
+    // The job was not completed by the stale attempt.
+    let current = businex_queue::get_job(&pool, job.id)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_ne!(current.state, "succeeded");
+    assert!(
+        businex_queue::pending_effects(&pool, job.id)
+            .await
+            .expect("effects")
+            .is_empty(),
+        "no external effect may be recorded by abandoned work"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cancellation_stops_handler_before_side_effects() {
+    let (_db, pool) = test_pool().await;
+    let company = new_company(&pool).await;
+    let kind = format!("slow-cancel-{}", uuid::Uuid::new_v4());
+    let job = match enqueue(&pool, NewJob::new(Some(company), kind.clone(), json!({})))
+        .await
+        .expect("enqueue")
+    {
+        EnqueueOutcome::Enqueued(j) => j,
+        _ => panic!("expected new job"),
+    };
+
+    let started = Arc::new(AtomicBool::new(false));
+    let effect_written = Arc::new(AtomicBool::new(false));
+    let handler = Arc::new(SlowHandler {
+        started: started.clone(),
+        effect_written: effect_written.clone(),
+    });
+    let mut worker = Worker::new(pool.clone(), Relay::new(RelayOptions::default()))
+        .with_lease(Duration::from_secs(30))
+        .with_poll_interval(Duration::from_millis(10));
+    worker.register(kind.clone(), handler);
+
+    let run = tokio::spawn(async move { worker.run_once().await });
+    wait_for(&started).await;
+
+    businex_queue::cancel(&pool, job.id).await.expect("cancel");
+
+    let report = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("worker must notice cancellation quickly")
+        .expect("join")
+        .expect("cycle")
+        .expect("job ran");
+    assert_eq!(report.outcome, "canceled", "canceled execution ends canceled");
+    assert!(
+        !effect_written.load(Ordering::SeqCst),
+        "handler side effects must not run after cancellation"
+    );
+    assert!(
+        businex_queue::pending_effects(&pool, job.id)
+            .await
+            .expect("effects")
+            .is_empty(),
+        "canceled work records no external effect"
+    );
+
+    // The heartbeat must have stopped with the attempt: the lease timestamp
+    // freezes instead of being extended forever by a leaked task.
+    let before = businex_queue::get_job(&pool, job.id)
+        .await
+        .expect("get")
+        .expect("row")
+        .lease_expires_at;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let after = businex_queue::get_job(&pool, job.id)
+        .await
+        .expect("get")
+        .expect("row")
+        .lease_expires_at;
+    assert_eq!(before, after, "heartbeat must stop when the attempt ends");
+}
+

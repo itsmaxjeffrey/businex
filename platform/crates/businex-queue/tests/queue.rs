@@ -5,6 +5,7 @@
 //! uses a unique job kind and claims only that kind, so parallel tests cannot
 //! take each other's jobs.
 
+use businex_db::TestDb;
 use businex_queue::{
     cancel, claim, complete, create_schedule, enqueue, fail, fire_due_schedules, get_job,
     heartbeat, is_canceled, pending_effects, record_effect, reclaim_expired, resolve_effect,
@@ -13,28 +14,21 @@ use businex_queue::{
 use chrono::{Duration, Utc};
 use serde_json::json;
 use sqlx::PgPool;
-use std::sync::OnceLock;
 use uuid::Uuid;
 
-fn database_url() -> String {
-    std::env::var("BUSINEX_TEST_DATABASE_URL")
-        .or_else(|_| std::env::var("DATABASE_URL"))
-        .expect("set BUSINEX_TEST_DATABASE_URL to a disposable PostgreSQL database")
-}
-
-/// Unique job kind per test run: claims stay inside one test.
+/// Unique job kind per test run: claims stay inside one test even if
+/// databases were shared.
 fn uniq(prefix: &str) -> String {
     format!("{}-{}", prefix, Uuid::new_v4())
 }
 
-async fn test_pool() -> PgPool {
-    static MIGRATED: OnceLock<()> = OnceLock::new();
-    let pool = businex_db::connect(&database_url(), 8).await.expect("connect");
-    if MIGRATED.get().is_none() {
-        businex_db::run_migrations(&pool).await.expect("migrate");
-        let _ = MIGRATED.set(());
-    }
-    pool
+/// A disposable database per test. Requires BUSINEX_TEST_DATABASE_URL (an
+/// explicitly disposable development server); there is no DATABASE_URL
+/// fallback because that variable may point at production.
+async fn test_pool() -> (TestDb, PgPool) {
+    let db = TestDb::new().await;
+    let pool = db.pool.clone();
+    (db, pool)
 }
 
 async fn new_company(pool: &PgPool) -> Uuid {
@@ -51,7 +45,7 @@ async fn new_company(pool: &PgPool) -> Uuid {
 
 #[tokio::test]
 async fn enqueue_and_claim_roundtrip() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("echo");
     let out = enqueue(
@@ -84,7 +78,7 @@ async fn enqueue_and_claim_roundtrip() {
 
 #[tokio::test]
 async fn duplicate_enqueue_is_prevented_by_idempotency_key() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("sync");
     let first = enqueue(
@@ -112,7 +106,7 @@ async fn duplicate_enqueue_is_prevented_by_idempotency_key() {
 
 #[tokio::test]
 async fn expired_lease_is_reclaimed_after_worker_death() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("long");
     let job = match enqueue(&pool, NewJob::new(Some(company), kind.clone(), json!({})))
@@ -148,7 +142,7 @@ async fn expired_lease_is_reclaimed_after_worker_death() {
 
 #[tokio::test]
 async fn stale_attempt_with_same_worker_id_is_fenced() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("fence");
     let job = match enqueue(&pool, NewJob::new(Some(company), kind.clone(), json!({})))
@@ -195,7 +189,7 @@ async fn stale_attempt_with_same_worker_id_is_fenced() {
 
 #[tokio::test]
 async fn expired_lease_cannot_complete_or_refresh() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("stale");
     enqueue(&pool, NewJob::new(Some(company), kind.clone(), json!({})))
@@ -221,7 +215,7 @@ async fn expired_lease_cannot_complete_or_refresh() {
 
 #[tokio::test]
 async fn retries_are_bounded_and_recorded() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind = uniq("flaky");
     let job = match enqueue(
@@ -262,7 +256,7 @@ async fn retries_are_bounded_and_recorded() {
 
 #[tokio::test]
 async fn cancellation_is_visible_and_truthful() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let kind_q = uniq("queued-kind");
     let queued = match enqueue(&pool, NewJob::new(Some(company), kind_q.clone(), json!({})))
@@ -299,7 +293,7 @@ async fn cancellation_is_visible_and_truthful() {
 
 #[tokio::test]
 async fn uncertain_external_outcomes_stay_reconcilable() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let job = match enqueue(&pool, NewJob::new(Some(company), uniq("webhook"), json!({})))
         .await
@@ -336,7 +330,7 @@ async fn uncertain_external_outcomes_stay_reconcilable() {
 
 #[tokio::test]
 async fn schedules_fire_exactly_once() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let schedule = create_schedule(
         &pool,
@@ -390,7 +384,7 @@ async fn schedules_fire_exactly_once() {
 
 #[tokio::test]
 async fn cron_schedules_advance_to_the_next_match() {
-    let pool = test_pool().await;
+    let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
     let schedule = create_schedule(
         &pool,
