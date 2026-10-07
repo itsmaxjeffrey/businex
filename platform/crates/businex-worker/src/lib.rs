@@ -205,18 +205,38 @@ impl Worker {
         let hb_lost = lost.clone();
         let hb_lease = self.lease;
         let heartbeat = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(hb_lease / 3);
+            // Cancellation and lease loss must stop handler work quickly even
+            // with long leases: probe at a short fixed cadence, but extend the
+            // lease only at its natural third-of-lease rhythm.
+            let extend_every = hb_lease / 3;
+            let poll = std::cmp::min(extend_every, Duration::from_millis(250));
+            let mut interval = tokio::time::interval(poll);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut since_extend = Duration::ZERO;
             loop {
                 interval.tick().await;
-                match queue::heartbeat(&hb_pool, &hb_job, hb_lease).await {
-                    Ok(true) => {}
+                match queue::lease_held(&hb_pool, &hb_job).await {
                     Ok(false) => {
+                        // Canceled, lease expired, or fenced by a newer attempt.
                         hb_lost.store(true, Ordering::Relaxed);
                         let _ = stop_tx.send(true);
                         break;
                     }
+                    Ok(true) => {}
                     Err(_) => {} // transient database error: retry next tick
+                }
+                since_extend += poll;
+                if since_extend >= extend_every {
+                    since_extend = Duration::ZERO;
+                    match queue::heartbeat(&hb_pool, &hb_job, hb_lease).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            hb_lost.store(true, Ordering::Relaxed);
+                            let _ = stop_tx.send(true);
+                            break;
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         });

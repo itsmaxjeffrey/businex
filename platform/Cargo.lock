@@ -249,6 +249,7 @@ name = "businex-api"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "async-trait",
  "axum",
  "businex-core",
  "businex-db",
@@ -257,6 +258,7 @@ dependencies = [
  "chrono",
  "hex",
  "rand 0.8.8",
+ "redis",
  "serde",
  "serde_json",
  "sha2",

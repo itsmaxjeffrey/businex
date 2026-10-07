@@ -72,11 +72,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(false),
     };
 
+    // Shared rate limiting across processes when Redis is configured; the
+    // limiter falls back to in-process counting during a Redis outage.
+    let rate_limiter: std::sync::Arc<dyn businex_api::ratelimit::RateLimiter> =
+        match std::env::var("BUSINEX_REDIS_URL") {
+            Ok(url) => {
+                let secret: Option<String> = std::env::var("BUSINEX_REDIS_PASSWORD_FILE")
+                    .ok()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                std::sync::Arc::new(businex_api::ratelimit::RedisRateLimiter::new(
+                    &url,
+                    secret.as_deref(),
+                ))
+            }
+            Err(_) => {
+                std::sync::Arc::new(businex_api::ratelimit::MemoryRateLimiter::new())
+            }
+        };
+
     let app = router(AppState {
         pool: pool.clone(),
         relay: relay.clone(),
         started_at: Instant::now(),
         config,
+        rate_limiter,
     });
 
     let addr = format!("{}:{}", host, port);

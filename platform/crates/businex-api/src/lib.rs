@@ -17,6 +17,7 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::TraceLayer;
 
 pub mod auth;
+pub mod ratelimit;
 mod routes_identity;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,6 +47,24 @@ pub struct AppState {
     pub relay: Relay,
     pub started_at: Instant,
     pub config: AppConfig,
+    pub rate_limiter: std::sync::Arc<dyn ratelimit::RateLimiter>,
+}
+
+impl AppState {
+    /// In-process limiter default for tests and single-node development.
+    pub fn with_memory_limiter(
+        pool: sqlx::PgPool,
+        relay: Relay,
+        config: AppConfig,
+    ) -> Self {
+        AppState {
+            pool,
+            relay,
+            started_at: Instant::now(),
+            config,
+            rate_limiter: std::sync::Arc::new(ratelimit::MemoryRateLimiter::new()),
+        }
+    }
 }
 
 pub fn router(state: AppState) -> Router {

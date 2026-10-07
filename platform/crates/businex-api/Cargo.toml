@@ -10,9 +10,11 @@ path = "src/main.rs"
 
 [dependencies]
 argon2 = "0.5"
+async-trait.workspace = true
 axum.workspace = true
 hex.workspace = true
 rand.workspace = true
+redis.workspace = true
 sha2.workspace = true
 businex-core.workspace = true
 businex-db.workspace = true

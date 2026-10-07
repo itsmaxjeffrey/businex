@@ -8,22 +8,20 @@ use businex_api::{router, AppConfig, AppState};
 use businex_db::TestDb;
 use businex_events::{Relay, RelayOptions};
 use serde_json::{json, Value};
-use std::time::Instant;
 use tower::ServiceExt;
 
 /// A disposable database per test (requires BUSINEX_TEST_DATABASE_URL).
 async fn test_state() -> (TestDb, AppState) {
     let db = TestDb::new().await;
-    let state = AppState {
-        pool: db.pool.clone(),
-        relay: Relay::new(RelayOptions::default()),
-        started_at: Instant::now(),
-        config: AppConfig {
+    let state = AppState::with_memory_limiter(
+        db.pool.clone(),
+        Relay::new(RelayOptions::default()),
+        AppConfig {
             session_ttl_secs: 3600,
             cookie_secure: false,
             dev_login_enabled: true,
         },
-    };
+    );
     (db, state)
 }
 

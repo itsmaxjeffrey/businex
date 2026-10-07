@@ -7,18 +7,16 @@ use businex_db::TestDb;
 use businex_events::{Relay, RelayOptions};
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
-use std::time::Instant;
 use tower::ServiceExt;
 
 /// A disposable database per test (requires BUSINEX_TEST_DATABASE_URL).
 async fn test_state() -> (TestDb, AppState) {
     let db = TestDb::new().await;
-    let state = AppState {
-        pool: db.pool.clone(),
-        relay: Relay::new(RelayOptions::default()),
-        started_at: Instant::now(),
-        config: AppConfig::default(),
-    };
+    let state = AppState::with_memory_limiter(
+        db.pool.clone(),
+        Relay::new(RelayOptions::default()),
+        AppConfig::default(),
+    );
     (db, state)
 }
 
@@ -69,12 +67,11 @@ async fn readyz_fails_when_database_is_down() {
     let bad_pool = PgPoolOptions::new()
         .connect_lazy("postgres://nouser:nopass@127.0.0.1:1/nope")
         .expect("lazy pool");
-    let app = router(AppState {
-        pool: bad_pool,
-        relay: Relay::new(RelayOptions::default()),
-        started_at: Instant::now(),
-        config: AppConfig::default(),
-    });
+    let app = router(AppState::with_memory_limiter(
+        bad_pool,
+        Relay::new(RelayOptions::default()),
+        AppConfig::default(),
+    ));
     let resp = app
         .oneshot(
             Request::builder()

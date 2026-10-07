@@ -318,6 +318,32 @@ pub async fn reclaim_expired(pool: &PgPool) -> Result<Vec<Job>, QueueError> {
     Ok(jobs)
 }
 
+/// Fast probe: does this attempt still hold a fresh lease on an uncanceled
+/// job? Unlike heartbeat this never extends anything; workers use it to stop
+/// handler work quickly on cancellation or lease loss.
+pub async fn lease_held(pool: &PgPool, job: &Job) -> Result<bool, QueueError> {
+    let Some(token) = job.lease_token else {
+        return Ok(false);
+    };
+    let row: (bool,) = sqlx::query_as(
+        "SELECT EXISTS (
+             SELECT 1 FROM jobs
+             WHERE id = $1
+               AND state = 'leased'
+               AND lease_owner = $2
+               AND lease_token = $3
+               AND lease_expires_at > now()
+               AND canceled_at IS NULL
+           )",
+    )
+    .bind(job.id)
+    .bind(&job.lease_owner)
+    .bind(token)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.0)
+}
+
 /// Extend the lease of a running job. Fenced: requires the matching lease
 /// token and a lease that has not expired yet. Returns false when the lease is
 /// stale, expired, lost to another worker or canceled.

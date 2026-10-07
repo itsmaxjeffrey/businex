@@ -31,23 +31,56 @@ pub enum AuthError {
     Invalid(String),
 }
 
-/// Hash a password with Argon2id. Each hash embeds its own random salt.
-pub fn hash_password(password: &str) -> Result<String, AuthError> {
-    let salt = SaltString::generate(&mut OsRng);
-    let hash = Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|_| AuthError::Invalid("password hashing failed".into()))?;
-    Ok(hash.to_string())
+/// Argon2 is deliberately expensive; all password work runs on the blocking
+/// pool through these async wrappers, bounded so a burst of logins cannot
+/// exhaust the runtime or the machine.
+const MAX_CONCURRENT_PASSWORD_OPS: usize = 4;
+
+fn password_slots() -> &'static tokio::sync::Semaphore {
+    use std::sync::OnceLock;
+    static SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_PASSWORD_OPS))
 }
 
-pub fn verify_password(password: &str, stored: &str) -> bool {
-    PasswordHash::new(stored)
-        .map(|parsed| {
-            Argon2::default()
-                .verify_password(password.as_bytes(), &parsed)
-                .is_ok()
-        })
-        .unwrap_or(false)
+/// Hash a password with Argon2id on the blocking pool. Each hash embeds its
+/// own random salt.
+pub async fn hash_password(password: String) -> Result<String, AuthError> {
+    let permit = password_slots()
+        .acquire()
+        .await
+        .map_err(|_| AuthError::Invalid("password service unavailable".into()))?;
+    let result = tokio::task::spawn_blocking(move || -> Result<String, AuthError> {
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::default()
+            .hash_password(password.as_bytes(), &salt)
+            .map_err(|_| AuthError::Invalid("password hashing failed".into()))?;
+        Ok(hash.to_string())
+    })
+    .await
+    .map_err(|_| AuthError::Invalid("password service unavailable".into()))?;
+    drop(permit);
+    result
+}
+
+/// Verify a password with Argon2id on the blocking pool.
+pub async fn verify_password(password: String, stored: String) -> Result<bool, AuthError> {
+    let permit = password_slots()
+        .acquire()
+        .await
+        .map_err(|_| AuthError::Invalid("password service unavailable".into()))?;
+    let result = tokio::task::spawn_blocking(move || -> bool {
+        PasswordHash::new(&stored)
+            .map(|parsed| {
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &parsed)
+                    .is_ok()
+            })
+            .unwrap_or(false)
+    })
+    .await
+    .map_err(|_| AuthError::Invalid("password service unavailable".into()))?;
+    drop(permit);
+    Ok(result)
 }
 
 fn hash_token(token: &str) -> String {

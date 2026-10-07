@@ -8,9 +8,10 @@ use crate::auth::{
     create_session, hash_password, revoke_session, session_cookie, token_from_headers,
     user_from_token, verify_password, AuthError, CurrentUser,
 };
+use crate::ratelimit::RateDecision;
 use crate::{error_response, AppState};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -189,6 +190,56 @@ async fn finish_login_async(
     Ok(resp)
 }
 
+/// Fixed-window auth limits: 10 attempts per hour per client identity.
+const AUTH_RATE_LIMIT: u64 = 10;
+const AUTH_RATE_WINDOW_SECS: u64 = 3600;
+
+fn rate_limited(retry_after_secs: u64) -> Response {
+    let mut resp = (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "too many attempts"})),
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        resp.headers_mut().insert("retry-after", value);
+    }
+    resp
+}
+
+/// The client identity for rate limiting: forwarded address when behind the
+/// deployment proxy, else the remote address header value, else email. This
+/// is an abuse control, not an authentication signal.
+fn rate_key(headers: &HeaderMap, email: &str) -> String {
+    let client = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .or_else(|| {
+            headers
+                .get("x-real-ip")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| email.to_lowercase());
+    format!("auth:{}", client)
+}
+
+async fn enforce_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    email: &str,
+) -> Result<(), Response> {
+    match state
+        .rate_limiter
+        .check(&rate_key(headers, email), AUTH_RATE_LIMIT, AUTH_RATE_WINDOW_SECS)
+        .await
+    {
+        RateDecision::Allow { .. } => Ok(()),
+        RateDecision::Deny { retry_after_secs } => Err(rate_limited(retry_after_secs)),
+    }
+}
+
 /// Local development login and first-user registration. Registration is gated
 /// by configuration; it is never open on a production deployment.
 async fn register(
@@ -196,6 +247,7 @@ async fn register(
     headers: HeaderMap,
     Json(input): Json<Credentials>,
 ) -> Result<Response, Response> {
+    enforce_rate_limit(&state, &headers, &input.email).await?;
     if !state.config.dev_login_enabled {
         return Err(error_response(&Error::Forbidden {
             action: "register".into(),
@@ -207,7 +259,7 @@ async fn register(
             message: "valid email and password of at least 8 characters required".into(),
         }));
     }
-    let password_hash = hash_password(&input.password).map_err(map_auth)?;
+    let password_hash = hash_password(input.password.clone()).await.map_err(map_auth)?;
     let name = input
         .name
         .clone()
@@ -243,6 +295,7 @@ async fn login(
     headers: HeaderMap,
     Json(input): Json<Credentials>,
 ) -> Result<Response, Response> {
+    enforce_rate_limit(&state, &headers, &input.email).await?;
     let row: Option<(Uuid, String, String, Option<String>)> = sqlx::query_as(
         "SELECT id, email, name, password_hash FROM users WHERE email = $1",
     )
@@ -252,7 +305,10 @@ async fn login(
     .map_err(|_| error_response(&Error::Internal("database error".into())))?;
     let (id, email, name, password_hash) = row.ok_or_else(|| map_auth(AuthError::InvalidCredentials))?;
     let stored = password_hash.ok_or_else(|| map_auth(AuthError::InvalidCredentials))?;
-    if !verify_password(&input.password, &stored) {
+    let password_ok = verify_password(input.password.clone(), stored)
+        .await
+        .map_err(map_auth)?;
+    if !password_ok {
         return Err(map_auth(AuthError::InvalidCredentials));
     }
     let user = CurrentUser {
