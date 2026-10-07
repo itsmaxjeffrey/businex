@@ -11,9 +11,10 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-07 (runs 1-19). Test tally: 58 passing (cargo test,
-run18 + repeated run19, both green, zero failures): api 5, identity 3, core 13,
-rls 4, events 7, queue 17, worker 9. Tests run against per-test disposable
+Last updated: 2026-10-07 (runs 1-20). Test tally: 103 passing across 26
+targets (cargo test run20, zero failures): api 5, identity 3, core 13, rls 4,
+events 7, queue 17, worker 9, models 45 (types/pricing 27 unit, adapter
+contracts 11, durable store 7). Tests run against per-test disposable
 databases on the protected dev stack (dev-test.env).
 
 ## Phase 0 - Inspection, safety, planning
@@ -46,8 +47,8 @@ databases on the protected dev stack (dev-test.env).
 | T11 | Generated backend extensions: TypeScript on Node LTS in isolated containers with resource/time/network limits and scoped API credentials; no host Docker socket, no unrestricted secrets, no direct production DB | incomplete | |
 | T12 | Typed TypeScript app SDK and OpenAPI API contracts | incomplete | |
 | T13 | Versioned app manifests (permissions, data schemas, routes, schedules, dependencies), compiled immutable bundles, per-company installs and version history | incomplete | |
-| T14 | Model adapters: OpenAI, Anthropic, Gemini, OpenAI-compatible/local, Xiaomi for builder where configured | incomplete | |
-| T15 | Per-company model keys stored protected, streaming, model selection, budgets, token/cost tracking with explicit unknown prices | incomplete | |
+| T14 | Model adapters: OpenAI, Anthropic, Gemini, OpenAI-compatible/local, Xiaomi for builder where configured | implemented | businex-models adapters for all five protocol families (OpenAI chat-completions also drives compatible/local/Xiaomi endpoints; Anthropic Messages; Gemini generateContent). Contract-tested against a local mock provider over real HTTP (11 tests): complete + streaming, chunk-split/multibyte SSE reassembly, provider error frames, premature EOF, sanitized rejections. Real provider execution (A6) remains open until live credentials are exercised |
+| T15 | Per-company model keys stored protected, streaming, model selection, budgets, token/cost tracking with explicit unknown prices | implemented | Keys sealed AES-256-GCM with random nonces and tenant+provider authenticated binding (moved ciphertext fails open; debug redacts material). Streaming via robust SSE parser. Pricing carries provider/model/currency/effective date/estimate flag; cost uses checked arithmetic; absent usage stays Option::None and yields unknown cost. Durable budgets in PostgreSQL (migration 0006) with atomic reserve/settle/release under a row lock: concurrent reservations cannot double-spend, settled reservations cannot replay, totals survive restart (store tests, 7). Model selection wiring into the builder lands with Phase 5 |
 | T16 | PostgreSQL durable queue: leases, cancellation, schedules, bounded retries, idempotency, uncertain external-outcome handling | tested | businex-queue + businex-worker, 17 tests: claim/complete roundtrip with fencing token; duplicate enqueue prevented by idempotency key; worker-death lease expiry reclaim and restart recovery; stale attempt fenced even with same worker id (expired lease cannot complete, fail or heartbeat); bounded retries recorded; cancellation truthful for queued and leased jobs; tenant-scoped cancellation denied across companies (RLS); schedules fire exactly once (interval + cron) with replay-proof idempotency keys; external effects recorded pending before the call and never auto-replayed (blind retry refused, reconciler path tested) |
 | T17 | OpenTelemetry, structured redacted logs, health/readiness, latency/job/model usage metrics | incomplete | Structured JSON logs via tracing-subscriber with documented redaction policy (never log secrets, tokens, provider errors, headers); /healthz liveness, /readyz dependency readiness, /api/health summary with request-id propagation and trace layer. OpenTelemetry metrics and latency/job/model usage metrics remain |
 | T18 | Cargo tests, Vitest, Playwright, container CI/CD, Docker Compose self-hosting, managed-cloud deployment templates and provisioning scripts with explicit secrets and backups; no unsupported one-click claims | incomplete | |
