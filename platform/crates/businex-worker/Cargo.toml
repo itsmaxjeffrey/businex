@@ -1,0 +1,26 @@
+[package]
+name = "businex-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "businex-worker"
+path = "src/main.rs"
+
+[dependencies]
+async-trait.workspace = true
+businex-core.workspace = true
+businex-db.workspace = true
+businex-events.workspace = true
+businex-queue.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "sync"] }

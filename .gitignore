@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+platform/target/
 .run/
 .businex/
 *.log

@@ -1,0 +1,29 @@
+[package]
+name = "businex-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "businex-api"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+businex-core.workspace = true
+businex-db.workspace = true
+businex-events.workspace = true
+businex-queue.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
