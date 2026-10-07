@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Docs — Businex</title>
+<meta name="description" content="Quick start, configuration, API overview and agent integration guides for Businex.">
+<meta name="theme-color" content="#05070D">
+<meta property="og:title" content="Docs — Businex">
+<meta property="og:description" content="Quick start, configuration, API overview and agent integration guides for Businex.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://businex.app">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%2305070D'/%3E%3Cpath d='M20 44V20h12a8 8 0 0 1 0 16h-6' stroke='%2300E5C8' stroke-width='5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='44' cy='42' r='4' fill='%235B8CFF'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@400;600;800&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/assets/site.css">
+</head>
+<body>
+<nav><div class="wrap nav-in">
+<a class="logo" href="/">BUSINEX<span>.</span></a>
+<div class="nav-links">
+<a href="/features.html">Features</a>
+<a href="/docs.html" style="color:var(--fg)">Docs</a>
+<a href="https://github.com/itsmaxjeffrey/businex" target="_blank" rel="noreferrer">GitHub</a>
+<a class="btn btn-primary" href="/app/">Open live demo</a>
+</div></div></nav>
+<header class="hero" style="padding:72px 0 40px"><div class="wrap">
+<span class="eyebrow">documentation</span>
+<h1 style="font-size:clamp(32px,4.6vw,52px)">Run it in <span class="accent">one command.</span></h1>
+<p class="lead">Everything works with zero configuration. Node.js 22+ is the only requirement.</p>
+</div></header>
+<section><div class="wrap">
+<h2>Quick start</h2>
+<pre><span class="c"># clone and start</span>
+git clone https://github.com/itsmaxjeffrey/businex.git
+cd businex
+npm install
+npm run dev
+
+<span class="c"># web desktop → </span><span class="k">http://localhost:5199</span>
+<span class="c"># API          → </span><span class="k">http://127.0.0.1:8788/api/health</span></pre>
+<p class="sub" style="margin-top:18px">Register on first launch and you get a clean workspace with the full module map — no sample data, no external accounts.</p>
+</div></section>
+<section><div class="wrap">
+<h2>Configuration</h2>
+<table><thead><tr><th>Variable</th><th>Default</th><th>Purpose</th></tr></thead><tbody>
+<tr><td><code>BUSINEX_HOST</code></td><td>127.0.0.1</td><td>API bind address</td></tr>
+<tr><td><code>BUSINEX_PORT</code></td><td>8788</td><td>API port</td></tr>
+<tr><td><code>BUSINEX_WEB_ORIGIN</code></td><td>http://localhost:5199</td><td>Allowed web origin</td></tr>
+<tr><td><code>BUSINEX_DATA_DIR</code></td><td>apps/server/data</td><td>Database, secrets, uploads</td></tr>
+</tbody></table>
+</div></section>
+<section id="openclaw"><div class="wrap">
+<h2>OpenClaw integration</h2>
+<p class="sub">Connect a gateway in Settings → Agents, then run sessions, send messages and list automations from the workspace. Agents can operate Businex records through scoped API keys — install the bundled skill:</p>
+<pre><span class="c"># in your OpenClaw agent workspace</span>
+cp integrations/openclaw/SKILL.md ~/.agents/skills/businex/SKILL.md
+
+<span class="c"># the skill drives the REST API with a scoped key</span>
+Authorization: ***<span class="k">bnx_…</span></pre>
+</div></section>
+<section id="open-tag"><div class="wrap">
+<h2>open-tag collaboration</h2>
+<p class="sub">Channels, threads, mentions and shared tasks follow the open-tag model natively. Bridge agent execution to an open-tag daemon to run Claude Code, Codex, Copilot or OpenClaw runtimes as teammates — replies land back in the originating thread.</p>
+<pre>user: <span class="k">@ops-bot</span> where does the Acme rollout stand?
+agent: proposal stage (48k) · 2 tasks open · sign-off Friday</pre>
+</div></section>
+<section id="mcp"><div class="wrap">
+<h2>MCP server</h2>
+<p class="sub">Any MCP-capable runtime can use Businex as a toolset:</p>
+<pre>POST /api/mcp   <span class="c"># JSON-RPC 2.0</span>
+
+tools: businex.search · businex.contact.create · businex.task.create
+       businex.document.write · businex.invoice.create
+       businex.channel.post · businex.analytics.overview</pre>
+</div></section>
+<section><div class="wrap">
+<h2>Development</h2>
+<pre>npm run dev      <span class="c"># server + web together</span>
+npm run build    <span class="c"># typecheck + production build</span>
+npm test         <span class="c"># unit tests (server + web)</span>
+npm run smoke    <span class="c"># end-to-end smoke test: 24 checks</span></pre>
+</div></section>
+<footer><div class="wrap foot-grid">
+<div>
+<div class="logo" style="margin-bottom:12px">BUSINEX<span>.</span></div>
+<p style="max-width:280px">The local-first operating layer for your business and its agents. Open source under Apache 2.0.</p>
+</div>
+<div>
+<strong style="color:var(--fg)">Product</strong>
+<a href="/features.html">Features</a>
+<a href="/app/">Live demo</a>
+<a href="/docs.html">Quick start</a>
+</div>
+<div>
+<strong style="color:var(--fg)">Integrations</strong>
+<a href="/docs.html#openclaw">OpenClaw</a>
+<a href="/docs.html#open-tag">open-tag</a>
+<a href="/docs.html#mcp">MCP server</a>
+</div>
+<div>
+<strong style="color:var(--fg)">Project</strong>
+<a href="https://github.com/itsmaxjeffrey/businex" target="_blank" rel="noreferrer">GitHub repository</a>
+<a href="https://github.com/itsmaxjeffrey/businex/blob/main/CONTRIBUTING.md" target="_blank" rel="noreferrer">Contributing</a>
+<a href="https://github.com/itsmaxjeffrey/businex/blob/main/LICENSE" target="_blank" rel="noreferrer">License</a>
+</div>
+</div>
+<div class="wrap" style="margin-top:40px;font-size:12.5px;opacity:.6">© 2026 Businex — built local-first. Your data stays on your machine.</div>
+</footer>
+</body></html>

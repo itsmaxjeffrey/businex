@@ -1,0 +1,25 @@
+{
+  "name": "businex",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Businex — Business OS: the local-first operating layer for your business and its agents.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/itsmaxjeffrey/businex.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "npm run build -w @businex/server && npm run build -w @businex/web",
+    "test": "npm run test -w @businex/server && npm run test -w @businex/web",
+    "smoke": "node scripts/smoke.mjs",
+    "db": "node scripts/db.mjs"
+  }
+}

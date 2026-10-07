@@ -1,0 +1,23 @@
+node_modules/
+dist/
+build/
+.run/
+.businex/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage/
+*.tsbuildinfo
+apps/server/data/
+apps/server/uploads/
+
+# OpenClaw agent workspace files — never publish
+AGENTS.md
+SOUL.md
+USER.md
+IDENTITY.md
+BOOTSTRAP.md
+DREAMS.md
+memory/
