@@ -13,7 +13,7 @@ use crate::{error_response, AppState};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use businex_core::{ActionGrant, Actor, Authorization, Error, Permission, ResourceScope, Role};
 use chrono::{Duration, Utc};
@@ -31,6 +31,15 @@ pub fn router() -> Router<AppState> {
         .route("/api/auth/me", get(me))
         .route("/api/companies", get(my_companies).post(create_company))
         .route("/api/companies/{id}/members", get(list_members))
+        .route(
+            "/api/companies/{id}/members/{user_id}",
+            patch(update_member).delete(remove_member),
+        )
+        .route(
+            "/api/companies/{id}/grants",
+            get(list_grants).post(create_grant),
+        )
+        .route("/api/companies/{id}/grants/{grant_id}", axum::routing::delete(revoke_grant))
         .route("/api/companies/{id}/invitations", post(create_invitation))
         .route("/api/invitations/accept", post(accept_invitation))
 }
@@ -635,4 +644,405 @@ async fn accept_invitation(
         .map_err(|_| error_response(&Error::Internal("database error".into())))?;
 
     Ok(Json(json!({"companyId": company_id, "role": role.as_str()})).into_response())
+}
+
+
+// ---------------------------------------------------------------------------
+// Membership management: role changes and removal, escalation-proof.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct MemberUpdate {
+    role: String,
+}
+
+/// Change a member's role. Rules enforced here:
+/// - requires members.manage (admin or owner);
+/// - the owner role is transfer-only and can never be set here;
+/// - nobody may grant a role above their own (no self-escalation path);
+/// - changing your own role cannot raise it;
+/// - every change is audited.
+async fn update_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+    Json(input): Json<MemberUpdate>,
+) -> Result<Response, Response> {
+    let user = current_user(&state, &headers).await?;
+    let auth = authorize(&state, &user, company_id, Permission::MembersManage, "*").await?;
+    let new_role = Role::parse(&input.role).ok_or_else(|| {
+        error_response(&Error::Invalid {
+            message: "unknown role".into(),
+        })
+    })?;
+    if new_role == Role::Owner {
+        return Err(error_response(&Error::Invalid {
+            message: "owner role is assigned by transfer only".into(),
+        }));
+    }
+    // No privilege escalation: the target role cannot exceed the actor's role.
+    if new_role > auth.role {
+        return Err(error_response(&Error::Forbidden {
+            action: "members.update".into(),
+            reason: "cannot grant a role above your own".into(),
+        }));
+    }
+    let ctx = businex_db::CompanyContext::with_actor(company_id, user.id);
+    let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    // Serialize owner-affecting membership changes per company so concurrent
+    // requests cannot both demote the last two owners.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(company_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let previous: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM memberships WHERE company_id = $1 AND user_id = $2")
+            .bind(company_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let (previous_role,) = previous.ok_or_else(|| {
+        error_response(&Error::NotFound {
+            entity: "membership".into(),
+        })
+    })?;
+    // Fail closed on malformed stored roles: a broken role record must never
+    // be silently treated as the lowest privilege.
+    let previous_parsed = Role::parse(&previous_role).ok_or_else(|| {
+        error_response(&Error::Forbidden {
+            action: "members.update".into(),
+            reason: "membership role is invalid; manual repair required".into(),
+        })
+    })?;
+    // Never modify a membership whose current role is above your own.
+    if previous_parsed > auth.role {
+        return Err(error_response(&Error::Forbidden {
+            action: "members.update".into(),
+            reason: "cannot modify a role above your own".into(),
+        }));
+    }
+    // Owner rows follow the transfer policy: only owners change them.
+    if previous_parsed == Role::Owner && auth.role != Role::Owner {
+        return Err(error_response(&Error::Forbidden {
+            action: "members.update".into(),
+            reason: "owner roles change only under the owner transfer policy".into(),
+        }));
+    }
+    if user.id == user_id && new_role > previous_parsed {
+        return Err(error_response(&Error::Forbidden {
+            action: "members.update".into(),
+            reason: "cannot raise your own role".into(),
+        }));
+    }
+    // Demoting an owner must leave at least one owner behind.
+    if previous_parsed == Role::Owner && new_role != Role::Owner {
+        let owners: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM memberships WHERE company_id = $1 AND role = 'owner'",
+        )
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+        if owners.0 <= 1 {
+            return Err(error_response(&Error::Forbidden {
+                action: "members.update".into(),
+                reason: "the last owner cannot be demoted; transfer ownership first".into(),
+            }));
+        }
+    }
+    sqlx::query(
+        "UPDATE memberships SET role = $3, updated_at = now()
+         WHERE company_id = $1 AND user_id = $2",
+    )
+    .bind(company_id)
+    .bind(user_id)
+    .bind(new_role.as_str())
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    tx.commit()
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    audit(
+        &state,
+        &auth,
+        "member.role_change",
+        "membership",
+        Some(user_id),
+        json!({"from": previous_role, "to": new_role.as_str()}),
+    )
+    .await;
+    Ok(Json(json!({"userId": user_id, "role": new_role.as_str()})).into_response())
+}
+
+/// Remove a member. Requires members.manage; the last owner cannot be
+/// removed (company transfer is a separate owner-only flow); audited.
+async fn remove_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((company_id, user_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, Response> {
+    let user = current_user(&state, &headers).await?;
+    let auth = authorize(&state, &user, company_id, Permission::MembersManage, "*").await?;
+    let ctx = businex_db::CompanyContext::with_actor(company_id, user.id);
+    let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    // Serialize owner-affecting membership changes per company.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(company_id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let target: Option<(String,)> =
+        sqlx::query_as("SELECT role FROM memberships WHERE company_id = $1 AND user_id = $2")
+            .bind(company_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let (target_role,) = target.ok_or_else(|| {
+        error_response(&Error::NotFound {
+            entity: "membership".into(),
+        })
+    })?;
+    // Fail closed on malformed stored roles.
+    let target_parsed = Role::parse(&target_role).ok_or_else(|| {
+        error_response(&Error::Forbidden {
+            action: "members.remove".into(),
+            reason: "membership role is invalid; manual repair required".into(),
+        })
+    })?;
+    // Never remove a membership whose role is above your own.
+    if target_parsed > auth.role {
+        return Err(error_response(&Error::Forbidden {
+            action: "members.remove".into(),
+            reason: "cannot remove a role above your own".into(),
+        }));
+    }
+    if target_parsed == Role::Owner {
+        if auth.role != Role::Owner {
+            return Err(error_response(&Error::Forbidden {
+                action: "members.remove".into(),
+                reason: "owner roles change only under the owner transfer policy".into(),
+            }));
+        }
+        let owners: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM memberships WHERE company_id = $1 AND role = 'owner'")
+                .bind(company_id)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+        if owners.0 <= 1 {
+            return Err(error_response(&Error::Forbidden {
+                action: "members.remove".into(),
+                reason: "the last owner cannot be removed; transfer ownership first".into(),
+            }));
+        }
+    }
+    sqlx::query("DELETE FROM memberships WHERE company_id = $1 AND user_id = $2")
+        .bind(company_id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    tx.commit()
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    audit(
+        &state,
+        &auth,
+        "member.remove",
+        "membership",
+        Some(user_id),
+        json!({"role": target_role}),
+    )
+    .await;
+    Ok(Json(json!({"removed": user_id})).into_response())
+}
+
+// ---------------------------------------------------------------------------
+// Agent / generated-app action grants: explicit permission-resource pairs.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct NewGrant {
+    actor_type: String,
+    actor_id: Uuid,
+    permission: String,
+    resource: String,
+    #[serde(default)]
+    expires_in_secs: Option<i64>,
+}
+
+/// Create a scoped action grant for an agent or generated app. The grant is
+/// exactly one permission on one resource: reading never implies writing, and
+/// the grant cannot exceed the granting member's own role permissions.
+async fn create_grant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(company_id): Path<Uuid>,
+    Json(input): Json<NewGrant>,
+) -> Result<Response, Response> {
+    let user = current_user(&state, &headers).await?;
+    let auth = authorize(&state, &user, company_id, Permission::AgentsManage, "*").await?;
+    let actor_type = match input.actor_type.as_str() {
+        "agent" => "agent",
+        "generated_app" => "generated_app",
+        _ => {
+            return Err(error_response(&Error::Invalid {
+                message: "actor_type must be agent or generated_app".into(),
+            }))
+        }
+    };
+    let permission = Permission::parse(&input.permission).map_err(|e| error_response(&e))?;
+    if input.resource.trim().is_empty() {
+        return Err(error_response(&Error::Invalid {
+            message: "resource is required".into(),
+        }));
+    }
+    // The issuer cannot hand out permissions they do not hold themselves.
+    if !auth.role.allows(permission) {
+        return Err(error_response(&Error::Forbidden {
+            action: "grants.create".into(),
+            reason: "cannot grant a permission your role does not hold".into(),
+        }));
+    }
+    // Bound the expiry window: chrono would panic on absurd i64 values and
+    // open-ended grants are not a sensible default.
+    let expires_at = match input.expires_in_secs {
+        Some(secs) if !(60..=31_536_000).contains(&secs) => {
+            return Err(error_response(&Error::Invalid {
+                message: "expires_in_secs must be between 60 and 31536000".into(),
+            }));
+        }
+        Some(secs) => Some(Utc::now() + Duration::seconds(secs)),
+        None => None,
+    };
+    let ctx = businex_db::CompanyContext::with_actor(company_id, user.id);
+    let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let grant_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO action_grants
+           (id, company_id, actor_type, actor_id, permission, resource, granted_by, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(grant_id)
+    .bind(company_id)
+    .bind(actor_type)
+    .bind(input.actor_id)
+    .bind(permission.as_str())
+    .bind(input.resource.trim())
+    .bind(user.id)
+    .bind(expires_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    tx.commit()
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    audit(
+        &state,
+        &auth,
+        "grant.create",
+        "action_grant",
+        Some(grant_id),
+        json!({
+            "actorType": actor_type,
+            "actorId": input.actor_id,
+            "permission": permission.as_str(),
+            "resource": input.resource.trim(),
+        }),
+    )
+    .await;
+    Ok(Json(json!({
+        "id": grant_id,
+        "permission": permission.as_str(),
+        "resource": input.resource.trim(),
+        "expiresAt": expires_at,
+    }))
+    .into_response())
+}
+
+async fn list_grants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(company_id): Path<Uuid>,
+) -> Result<Response, Response> {
+    let user = current_user(&state, &headers).await?;
+    authorize(&state, &user, company_id, Permission::AgentsManage, "*").await?;
+    let ctx = businex_db::CompanyContext::new(company_id);
+    let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let rows = sqlx::query(
+        "SELECT id, actor_type, actor_id, permission, resource, expires_at
+         FROM action_grants WHERE company_id = $1 ORDER BY created_at",
+    )
+    .bind(company_id)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    tx.commit()
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let grants: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.get::<Uuid, _>("id"),
+                "actorType": r.get::<String, _>("actor_type"),
+                "actorId": r.get::<Uuid, _>("actor_id"),
+                "permission": r.get::<String, _>("permission"),
+                "resource": r.get::<String, _>("resource"),
+                "expiresAt": r.get::<Option<chrono::DateTime<Utc>>, _>("expires_at"),
+            })
+        })
+        .collect();
+    Ok(Json(json!({"grants": grants})).into_response())
+}
+
+/// Revoke one grant. Revocation is immediate and audited; the grant row is
+/// retained with a revoked marker only through the audit log (delete here).
+async fn revoke_grant(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((company_id, grant_id)): Path<(Uuid, Uuid)>,
+) -> Result<Response, Response> {
+    let user = current_user(&state, &headers).await?;
+    let auth = authorize(&state, &user, company_id, Permission::AgentsManage, "*").await?;
+    let ctx = businex_db::CompanyContext::with_actor(company_id, user.id);
+    let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let deleted = sqlx::query("DELETE FROM action_grants WHERE company_id = $1 AND id = $2")
+        .bind(company_id)
+        .bind(grant_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    if deleted.rows_affected() == 0 {
+        return Err(error_response(&Error::NotFound {
+            entity: "grant".into(),
+        }));
+    }
+    tx.commit()
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    audit(
+        &state,
+        &auth,
+        "grant.revoke",
+        "action_grant",
+        Some(grant_id),
+        json!({}),
+    )
+    .await;
+    Ok(Json(json!({"revoked": grant_id})).into_response())
 }

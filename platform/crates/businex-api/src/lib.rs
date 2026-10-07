@@ -18,7 +18,7 @@ use tower_http::trace::TraceLayer;
 
 pub mod auth;
 pub mod ratelimit;
-mod routes_identity;
+pub mod routes_identity;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
