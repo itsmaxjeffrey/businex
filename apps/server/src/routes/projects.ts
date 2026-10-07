@@ -56,11 +56,6 @@ projectRoutes.post("/", requireScope("projects:write", "member"), async (c) => {
   return c.json(projectRow(db.prepare("SELECT * FROM projects WHERE id = ?").get(id)), 201);
 });
 
-projectRoutes.get("/:id", requireScope("projects:read", "viewer"), async (c) => {
-  const row = getDb().prepare("SELECT * FROM projects WHERE id = ? AND workspace_id = ?").get(param(c, "id"), auth(c).workspaceId) as any;
-  if (!row) throw notFound("Project not found");
-  return c.json(projectRow(row));
-});
 
 projectRoutes.patch("/:id", requireScope("projects:write", "member"), async (c) => {
   const a = auth(c);
@@ -70,8 +65,9 @@ projectRoutes.patch("/:id", requireScope("projects:write", "member"), async (c) 
   const parsed = projectSchema.partial().safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) throw badRequest("Invalid project", parsed.error.flatten());
   const merged = { ...existing, ...Object.fromEntries(Object.entries(parsed.data).map(([k, v]) => [k, v ?? null])) };
+  if ("dueDate" in parsed.data) merged.due_date = parsed.data.dueDate ?? null;
   db.prepare("UPDATE projects SET name=?, description=?, status=?, color=?, due_date=?, updated_at=? WHERE id=?")
-    .run(merged.name, merged.description, merged.status, merged.color, merged.due_date ?? merged.dueDate, now(), existing.id);
+    .run(merged.name, merged.description, merged.status, merged.color, merged.due_date, now(), existing.id);
   indexEntity(a.workspaceId, "project", existing.id, merged.name, merged.description ?? "");
   audit(a.workspaceId, actor(c), "project.update", "project", existing.id);
   return c.json(projectRow(db.prepare("SELECT * FROM projects WHERE id = ?").get(existing.id)));
@@ -107,6 +103,9 @@ projectRoutes.post("/tasks", requireScope("projects:write", "member"), async (c)
   const db = getDb();
   const id = newId("tsk");
   const t = now();
+  if (d.projectId && !db.prepare("SELECT 1 FROM projects WHERE id = ? AND workspace_id = ?").get(d.projectId, a.workspaceId)) {
+    throw notFound("Project not found");
+  }
   const maxPos = (db.prepare("SELECT COALESCE(MAX(position), 0) AS p FROM tasks WHERE workspace_id = ? AND status = ?").get(a.workspaceId, d.status) as any).p;
   db.prepare(`
     INSERT INTO tasks (id, workspace_id, project_id, title, description, status, priority, position, assignee_id, due_date, created_by, created_at, updated_at)
@@ -125,6 +124,9 @@ projectRoutes.patch("/tasks/:id", requireScope("projects:write", "member"), asyn
   if (!existing) throw notFound("Task not found");
   const parsed = taskSchema.partial().safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) throw badRequest("Invalid task", parsed.error.flatten());
+  if (parsed.data.projectId && !db.prepare("SELECT 1 FROM projects WHERE id = ? AND workspace_id = ?").get(parsed.data.projectId, a.workspaceId)) {
+    throw notFound("Project not found");
+  }
   const map: Record<string, string> = {
     projectId: "project_id", title: "title", description: "description", status: "status",
     priority: "priority", position: "position", assigneeId: "assignee_id", dueDate: "due_date",
@@ -164,12 +166,14 @@ projectRoutes.delete("/tasks/:id", requireScope("projects:write", "member"), asy
 });
 
 projectRoutes.get("/tasks/:id/comments", requireScope("projects:read", "viewer"), async (c) => {
+  if (!getDb().prepare("SELECT 1 FROM tasks WHERE id = ? AND workspace_id = ?").get(param(c, "id"), auth(c).workspaceId)) throw notFound("Task not found");
   const rows = getDb().prepare("SELECT * FROM task_comments WHERE task_id = ? ORDER BY created_at").all(param(c, "id")) as any[];
   return c.json({ items: rows.map((r) => ({ id: r.id, taskId: r.task_id, authorId: r.author_id, body: r.body, createdAt: r.created_at })) });
 });
 
 projectRoutes.post("/tasks/:id/comments", requireScope("projects:write", "member"), async (c) => {
   const a = auth(c);
+  if (!getDb().prepare("SELECT 1 FROM tasks WHERE id = ? AND workspace_id = ?").get(param(c, "id"), a.workspaceId)) throw notFound("Task not found");
   const body = await c.req.json().catch(() => ({}));
   const text = String(body.body ?? "").trim();
   if (!text) throw badRequest("body is required");
@@ -177,4 +181,11 @@ projectRoutes.post("/tasks/:id/comments", requireScope("projects:write", "member
   getDb().prepare("INSERT INTO task_comments (id, task_id, author_id, body, created_at) VALUES (?, ?, ?, ?, ?)")
     .run(id, param(c, "id"), a.userId, text, now());
   return c.json({ id }, 201);
+});
+
+// Register the project detail route after named subresources such as /tasks.
+projectRoutes.get("/:id", requireScope("projects:read", "viewer"), async (c) => {
+  const row = getDb().prepare("SELECT * FROM projects WHERE id = ? AND workspace_id = ?").get(param(c, "id"), auth(c).workspaceId) as any;
+  if (!row) throw notFound("Project not found");
+  return c.json(projectRow(row));
 });

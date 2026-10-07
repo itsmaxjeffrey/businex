@@ -3,6 +3,8 @@ import type { Server, IncomingMessage } from "node:http";
 import { getDb, parseJson } from "./db";
 import { verifyToken, hashToken } from "./lib/token";
 import { bus, type BusinexEvent } from "./events";
+import { config } from "./config";
+import { roleAtLeast } from "@businex/shared";
 import { writeTerminal, resizeTerminal, killTerminal } from "./terminal";
 
 interface Client {
@@ -10,9 +12,11 @@ interface Client {
   workspaceId: string;
   userId: string | null;
   terminalIds: Set<string>;
+  terminalRead: boolean;
+  terminalWrite: boolean;
 }
 
-function authenticateUpgrade(req: IncomingMessage): { workspaceId: string; userId: string | null } | null {
+function authenticateUpgrade(req: IncomingMessage): { workspaceId: string; userId: string | null; terminalRead: boolean; terminalWrite: boolean } | null {
   const url = new URL(req.url ?? "/", "http://localhost");
   const token = url.searchParams.get("token")
     ?? parseCookie(req.headers.cookie ?? "")["businex_session"];
@@ -20,9 +24,13 @@ function authenticateUpgrade(req: IncomingMessage): { workspaceId: string; userI
   const db = getDb();
 
   if (token.startsWith("bnx_")) {
-    const row = db.prepare("SELECT workspace_id, revoked_at FROM api_keys WHERE key_hash = ?").get(hashToken(token)) as any;
+    const row = db.prepare("SELECT workspace_id, revoked_at, scopes FROM api_keys WHERE key_hash = ?").get(hashToken(token)) as any;
     if (!row || row.revoked_at) return null;
-    return { workspaceId: row.workspace_id, userId: null };
+    const scopes = parseJson<string[]>(row.scopes, []);
+    if (!scopes.includes("*") && !scopes.includes("realtime:read")) return null;
+    return { workspaceId: row.workspace_id, userId: null,
+      terminalRead: scopes.some(s => ["*", "terminal:*", "terminal:read"].includes(s)),
+      terminalWrite: scopes.some(s => ["*", "terminal:*", "terminal:write"].includes(s)) };
   }
 
   const sessionId = verifyToken(token);
@@ -31,9 +39,9 @@ function authenticateUpgrade(req: IncomingMessage): { workspaceId: string; userI
   if (!session || new Date(session.expires_at).getTime() < Date.now()) return null;
   const workspaceId = url.searchParams.get("workspaceId");
   if (!workspaceId) return null;
-  const membership = db.prepare("SELECT 1 FROM memberships WHERE user_id = ? AND workspace_id = ?").get(session.user_id, workspaceId);
+  const membership = db.prepare("SELECT role FROM memberships WHERE user_id = ? AND workspace_id = ?").get(session.user_id, workspaceId) as { role: any } | undefined;
   if (!membership) return null;
-  return { workspaceId, userId: session.user_id };
+  return { workspaceId, userId: session.user_id, terminalRead: roleAtLeast(membership.role, "member"), terminalWrite: roleAtLeast(membership.role, "member") };
 }
 
 function parseCookie(header: string): Record<string, string> {
@@ -58,10 +66,13 @@ export function attachWebSocket(server: Server): WebSocketServer {
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname !== "/ws") { socket.destroy(); return; }
+    if (req.headers.origin && req.headers.origin !== config.webOrigin) {
+      socket.write("HTTP/1.1 403 Forbidden\r\n\r\n"); socket.destroy(); return;
+    }
     const auth = authenticateUpgrade(req);
     if (!auth) { socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n"); socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (ws) => {
-      const client: Client = { ws, workspaceId: auth.workspaceId, userId: auth.userId, terminalIds: new Set() };
+      const client: Client = { ws, workspaceId: auth.workspaceId, userId: auth.userId, terminalIds: new Set(), terminalRead: auth.terminalRead, terminalWrite: auth.terminalWrite };
       clients.add(client);
       ws.on("message", (raw) => {
         let msg: any;
@@ -74,6 +85,10 @@ export function attachWebSocket(server: Server): WebSocketServer {
   });
 
   function handleClientMessage(client: Client, msg: any): void {
+    if (String(msg.type).startsWith("terminal.")) {
+      if (!config.terminalEnabled || !client.terminalRead) return;
+      if (!["terminal.watch", "terminal.unwatch"].includes(msg.type) && !client.terminalWrite) return;
+    }
     switch (msg.type) {
       case "terminal.watch":
         if (typeof msg.terminalId === "string") client.terminalIds.add(msg.terminalId);

@@ -22,6 +22,10 @@ export const config = {
   host: process.env.BUSINEX_HOST ?? "127.0.0.1",
   port: Number(process.env.BUSINEX_PORT ?? 8788),
   webOrigin: process.env.BUSINEX_WEB_ORIGIN ?? "http://localhost:5199",
+  staticDir: process.env.BUSINEX_STATIC_DIR,
+  terminalEnabled: process.env.BUSINEX_TERMINAL_ENABLED === "true"
+    || (process.env.BUSINEX_TERMINAL_ENABLED !== "false" && process.env.NODE_ENV !== "production"),
+  registrationEmails: (process.env.BUSINEX_REGISTRATION_EMAILS ?? "").split(",").map(s => s.trim().toLowerCase()).filter(Boolean),
   dataDir,
   dbPath: process.env.BUSINEX_DB_PATH ?? path.join(dataDir, "businex.db"),
   uploadsDir: process.env.BUSINEX_UPLOADS_DIR ?? path.join(dataDir, "uploads"),

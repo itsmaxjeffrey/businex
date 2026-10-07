@@ -40,6 +40,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
     method,
     headers,
     credentials: "same-origin",
+    signal: AbortSignal.timeout(30000),
     body: body === undefined ? undefined : JSON.stringify(body),
   });
 

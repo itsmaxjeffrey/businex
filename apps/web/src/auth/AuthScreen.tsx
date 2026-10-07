@@ -114,7 +114,7 @@ export function AuthScreen() {
           </form>
 
           <p className="mt-6 text-xs opacity-45">
-            Runs entirely on your machine. Your data never leaves your network.
+            Your business records and agent work, together in one workspace.
           </p>
         </div>
       </div>

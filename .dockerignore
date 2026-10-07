@@ -1,0 +1,14 @@
+.git
+node_modules
+**/node_modules
+**/data
+**/dist
+site
+memory
+AGENTS.md
+SOUL.md
+IDENTITY.md
+USER.md
+DREAMS.md
+work
+.env*

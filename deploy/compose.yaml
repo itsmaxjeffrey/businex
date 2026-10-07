@@ -1,0 +1,31 @@
+name: businex
+services:
+  app:
+    image: businex:production
+    build:
+      context: ..
+    restart: unless-stopped
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    tmpfs: [/tmp]
+    ports: ["127.0.0.1:8788:8788"]
+    environment:
+      BUSINEX_WEB_ORIGIN: https://app.businex.app
+      BUSINEX_REGISTRATION_EMAILS: ${BUSINEX_REGISTRATION_EMAILS:?Set invited account emails}
+    volumes: [businex-data:/data]
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?Set tunnel credential}
+    depends_on:
+      app:
+        condition: service_healthy
+volumes:
+  businex-data:

@@ -46,6 +46,7 @@ function issueSession(db: any, userId: string, userAgent: string | undefined): s
 function sessionCookie() {
   return {
     httpOnly: true,
+    secure: config.env === "production",
     sameSite: "Lax" as const,
     path: "/",
     maxAge: Math.floor(config.sessionTtlMs / 1000),
@@ -57,6 +58,9 @@ authRoutes.post("/register", async (c) => {
   const parsed = registerSchema.safeParse(body);
   if (!parsed.success) throw badRequest("Invalid registration payload", parsed.error.flatten());
   const { email, name, password, workspaceName } = parsed.data;
+  if (config.registrationEmails.length && !config.registrationEmails.includes(email.toLowerCase())) {
+    throw forbidden("Registration is limited to invited email addresses");
+  }
 
   const db = getDb();
   if (db.prepare("SELECT 1 FROM users WHERE email = ?").get(email)) throw conflict("An account with this email already exists");
@@ -186,18 +190,9 @@ authRoutes.post("/change-password", authenticate, async (c) => {
 authRoutes.post("/forgot-password", async (c) => {
   const body = await c.req.json().catch(() => ({}));
   const email = String(body.email ?? "").trim().toLowerCase();
-  const db = getDb();
-  const user = db.prepare("SELECT id FROM users WHERE email = ?").get(email) as any;
-  // Local-first: the reset token is returned in the response instead of emailing.
-  // Put a mailer in front of this endpoint for production delivery.
-  if (!user) return c.json({ ok: true, token: null });
-  const id = newId("rst");
-  const token = randomToken(24);
-  db.prepare(`
-    INSERT INTO password_resets (id, user_id, token_hash, created_at, expires_at)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(id, user.id, hashToken(token), now(), new Date(Date.now() + 3600_000).toISOString());
-  return c.json({ ok: true, token });
+  // Password recovery requires a verified mail delivery channel. Until configured,
+  // return the same response for every address and never expose a reset credential.
+  return c.json({ ok: true });
 });
 
 authRoutes.post("/reset-password", async (c) => {

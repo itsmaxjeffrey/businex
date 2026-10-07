@@ -1,8 +1,11 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { logger } from "hono/logger";
+import { serveStatic } from "@hono/node-server/serve-static";
+import { secureHeaders } from "hono/secure-headers";
+import { config } from "./config";
 import type { Env } from "./context";
-import { jsonError } from "./lib/errors";
+import { jsonError, forbidden } from "./lib/errors";
 import { authRoutes } from "./routes/auth";
 import { workspaceRoutes } from "./routes/workspaces";
 import { crmRoutes } from "./routes/crm";
@@ -21,8 +24,16 @@ import { openTagRoutes } from "./routes/opentag";
 export function createApp(): Hono<Env> {
   const app = new Hono<Env>();
 
+  app.use("*", secureHeaders());
+  app.use("*", async (c, next) => {
+    const origin = c.req.header("origin");
+    if (origin && origin !== config.webOrigin && !["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {
+      throw forbidden("Request origin is not allowed");
+    }
+    await next();
+  });
   app.use("*", cors({
-    origin: (origin) => origin || "*",
+    origin: (origin) => origin === config.webOrigin ? origin : undefined,
     credentials: true,
   }));
   if (process.env.NODE_ENV !== "test") app.use("*", logger());
@@ -51,6 +62,18 @@ export function createApp(): Hono<Env> {
   app.route("/api/terminals", terminalRoutes);
   app.route("/api", mcpRoutes);
   app.route("/api", openTagRoutes);
+
+  if (config.staticDir) {
+    const root = config.staticDir;
+    app.get("*", async (c, next) => {
+      if (c.req.path === "/api" || c.req.path.startsWith("/api/") || c.req.path === "/ws") return next();
+      return serveStatic({ root })(c, next);
+    });
+    app.get("*", async (c, next) => {
+      if (c.req.path === "/api" || c.req.path.startsWith("/api/") || c.req.path === "/ws" || c.req.path.startsWith("/assets/")) return next();
+      return serveStatic({ root, path: "index.html" })(c, next);
+    });
+  }
 
   app.notFound((c) => c.json({ error: { code: "not_found", message: "Route not found" } }, 404));
   return app;

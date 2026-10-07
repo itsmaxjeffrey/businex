@@ -2,10 +2,16 @@ import { param } from "../context";
 import { Hono } from "hono";
 import { authenticate, auth, requireWorkspace, requireScope, type Env } from "../context";
 import { createTerminal, listTerminals, getTerminal, killTerminal } from "../terminal";
-import { badRequest, notFound } from "../lib/errors";
+import { badRequest, notFound, forbidden } from "../lib/errors";
+
+import { config } from "../config";
 
 export const terminalRoutes = new Hono<Env>();
 terminalRoutes.use("*", authenticate, requireWorkspace);
+terminalRoutes.use("*", async (_c, next) => {
+  if (!config.terminalEnabled) throw forbidden("Terminal access is disabled on this deployment");
+  await next();
+});
 
 terminalRoutes.get("/", requireScope("terminal:read", "member"), async (c) => {
   return c.json({ items: listTerminals(auth(c).workspaceId) });

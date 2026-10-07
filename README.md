@@ -98,6 +98,13 @@ npm test           # unit + integration tests
 npm run smoke      # end-to-end smoke test against a running server
 ```
 
+## Production hosting
+
+The working app can be deployed with persistent SQLite storage using the included Docker image
+and [deployment guide](docs/deployment.md). The first hosted instance uses private access;
+the public website demo remains separate. Production disables terminal execution by default,
+restricts browser origins, and never exposes password recovery tokens.
+
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).

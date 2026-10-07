@@ -25,7 +25,14 @@ delete process.env.all_proxy;
 delete process.env.NODE_USE_ENV_PROXY;
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PORT = Number(process.env.BUSINEX_SMOKE_PORT ?? 8790);
+const PORT = process.env.BUSINEX_SMOKE_PORT ? Number(process.env.BUSINEX_SMOKE_PORT) : await new Promise((resolve, reject) => {
+  const probe = net.createServer();
+  probe.once("error", reject);
+  probe.listen(0, "127.0.0.1", () => {
+    const port = probe.address().port;
+    probe.close(() => resolve(port));
+  });
+});
 const BASE = "http://127.0.0.1:" + PORT;
 const dataDir = mkdtempSync(path.join(os.tmpdir(), "businex-smoke-"));
 
@@ -120,7 +127,7 @@ function check(name, condition, detail) {
   }
 }
 
-const server = spawn("npx", ["tsx", "src/index.ts"], {
+const server = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
   cwd: path.join(root, "apps/server"),
   env: cleanEnv({ BUSINEX_PORT: String(PORT), BUSINEX_DATA_DIR: dataDir, NODE_ENV: "test" }),
   stdio: ["ignore", "pipe", "pipe"],
@@ -141,8 +148,14 @@ async function waitForServer() {
   return false;
 }
 
-function cleanup(code) {
-  try { server.kill("SIGTERM"); } catch { /* gone */ }
+async function cleanup(code) {
+  if (server.exitCode === null && server.signalCode === null) {
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => { server.kill("SIGKILL"); }, 3000);
+      server.once("exit", () => { clearTimeout(timer); resolve(); });
+      server.kill("SIGTERM");
+    });
+  }
   rmSync(dataDir, { recursive: true, force: true });
   process.exit(code);
 }
@@ -152,7 +165,7 @@ async function main() {
   const up = await waitForServer();
   if (!up) {
     console.error("Server did not start. Log:\n" + serverLog.slice(-2000));
-    cleanup(1);
+    await cleanup(1);
     return;
   }
 
@@ -185,6 +198,8 @@ async function main() {
   check("create project", project.status === 201, project);
   const task = await call("POST", "/projects/tasks", { title: "Draft hero copy", projectId: project.data?.id });
   check("create task", task.status === 201, task);
+  const taskList = await call("GET", "/projects/tasks");
+  check("created task appears in task list", taskList.status === 200 && (taskList.data?.items ?? []).some(t => t.id === task.data?.id), taskList);
   const moved = await call("POST", "/projects/tasks/" + (task.data?.id ?? "missing") + "/move", { status: "done", position: 5 });
   check("move task to done", moved.status === 200 && moved.data?.status === "done", moved);
 
@@ -242,10 +257,10 @@ async function main() {
   check("audit log recorded mutations", (audit.data?.items ?? []).length >= 5, audit);
 
   console.log("\n\u001b[1m" + passed + " passed, " + failed + " failed\u001b[0m");
-  cleanup(failed > 0 ? 1 : 0);
+  await cleanup(failed > 0 ? 1 : 0);
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error("Smoke test crashed:", err);
-  cleanup(1);
+  await cleanup(1);
 });

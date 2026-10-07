@@ -188,3 +188,55 @@ describe("workspace isolation and scopes", () => {
     expect(res.data.items.length).toBeGreaterThan(3);
   });
 });
+
+
+describe("deployment boundaries", () => {
+  it("never returns password recovery credentials or discloses whether an account exists", async () => {
+    const known = await call("POST", "/auth/forgot-password", { email: "test@businex.local" });
+    const unknown = await call("POST", "/auth/forgot-password", { email: "missing@businex.local" });
+    expect(known).toEqual(unknown);
+    expect(known.data).toEqual({ ok: true });
+  });
+  it("rejects cross-origin mutations before changing business data", async () => {
+    const res = await call("POST", "/crm/contacts", { firstName: "Rejected" }, { Origin: "https://untrusted.example" });
+    expect(res.status).toBe(403);
+    const list = await call("GET", "/crm/contacts");
+    expect(list.data.items.some((x: any) => x.firstName === "Rejected")).toBe(false);
+  });
+  it("does not advertise credentialed CORS to unrelated websites", async () => {
+    const res = await app.request("/api/health", { headers: { Origin: "https://untrusted.example" } });
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
+  });
+  it("allows the configured browser origin", async () => {
+    const res = await app.request("/api/health", { headers: { Origin: "http://localhost:5199" } });
+    expect(res.headers.get("access-control-allow-origin")).toBe("http://localhost:5199");
+  });
+});
+
+
+describe("project and task workflows", () => {
+  it("lists created tasks through the task collection endpoint", async () => {
+    const task = await call("POST", "/projects/tasks", { title: "Visible in task list" });
+    const list = await call("GET", "/projects/tasks");
+    expect(list.status).toBe(200);
+    expect(list.data.items.some((x: any) => x.id === task.data.id)).toBe(true);
+  });
+  it("updates and clears project due dates without breaking detail retrieval", async () => {
+    const project = await call("POST", "/projects", { name: "Deployment", dueDate: "2026-11-01" });
+    const changed = await call("PATCH", "/projects/" + project.data.id, { dueDate: "2026-11-10" });
+    expect(changed.data.dueDate).toBe("2026-11-10");
+    const cleared = await call("PATCH", "/projects/" + project.data.id, { dueDate: null });
+    expect(cleared.data.dueDate).toBeNull();
+    expect((await call("GET", "/projects/" + project.data.id)).data.id).toBe(project.data.id);
+  });
+  it("isolates task comments and project assignment across workspaces", async () => {
+    const project = await call("POST", "/projects", { name: "Private project" });
+    const task = await call("POST", "/projects/tasks", { title: "Private task", projectId: project.data.id });
+    expect((await call("POST", "/projects/tasks/" + task.data.id + "/comments", { body: "Private comment" })).status).toBe(201);
+    const other = await call("POST", "/auth/register", { email: "comments-other@businex.local", name: "Other workspace", password: "other-test-pass" });
+    const headers = { Authorization: "Bearer " + other.data.token, "X-Workspace-Id": other.data.workspace.id };
+    expect((await call("GET", "/projects/tasks/" + task.data.id + "/comments", undefined, headers)).status).toBe(404);
+    expect((await call("POST", "/projects/tasks/" + task.data.id + "/comments", { body: "Blocked" }, headers)).status).toBe(404);
+    expect((await call("POST", "/projects/tasks", { title: "Blocked", projectId: project.data.id }, headers)).status).toBe(404);
+  });
+});
