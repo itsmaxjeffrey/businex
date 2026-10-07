@@ -1,10 +1,27 @@
-import React, { useCallback, useRef } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useWindows, type WindowState } from "../lib/store";
 
 export function WindowFrame({ win, children }: { win: WindowState; children: React.ReactNode }) {
   const { close, focus, setBounds, minimize, toggleMaximize } = useWindows();
+  const [hasBeenShown, setHasBeenShown] = useState(!win.minimized);
+  useEffect(() => { if (!win.minimized) setHasBeenShown(true); }, [win.minimized]);
   const dragRef = useRef<{ startX: number; startY: number; x: number; y: number } | null>(null);
   const resizeRef = useRef<{ startX: number; startY: number; w: number; h: number } | null>(null);
+
+  const frameRef = useRef<number | null>(null);
+  const pendingBounds = useRef<Partial<Pick<WindowState, "x" | "y" | "w" | "h">> | null>(null);
+  const queueBounds = useCallback((bounds: Partial<Pick<WindowState, "x" | "y" | "w" | "h">>) => {
+    pendingBounds.current = bounds;
+    if (frameRef.current !== null) return;
+    frameRef.current = requestAnimationFrame(() => {
+      frameRef.current = null;
+      if (pendingBounds.current) setBounds(win.id, pendingBounds.current);
+      pendingBounds.current = null;
+    });
+  }, [setBounds, win.id]);
+  useEffect(() => () => {
+    if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+  }, []);
 
   const onTitlePointerDown = useCallback((e: React.PointerEvent) => {
     if (win.maximized) return;
@@ -16,11 +33,11 @@ export function WindowFrame({ win, children }: { win: WindowState; children: Rea
   const onTitlePointerMove = useCallback((e: React.PointerEvent) => {
     const d = dragRef.current;
     if (!d) return;
-    setBounds(win.id, {
+    queueBounds({
       x: Math.max(8, d.x + (e.clientX - d.startX)),
       y: Math.max(48, d.y + (e.clientY - d.startY)),
     });
-  }, [setBounds, win.id]);
+  }, [queueBounds]);
 
   const onTitlePointerUp = useCallback(() => { dragRef.current = null; }, []);
 
@@ -34,11 +51,11 @@ export function WindowFrame({ win, children }: { win: WindowState; children: Rea
   const onResizePointerMove = useCallback((e: React.PointerEvent) => {
     const r = resizeRef.current;
     if (!r) return;
-    setBounds(win.id, {
+    queueBounds({
       w: Math.max(420, r.w + (e.clientX - r.startX)),
       h: Math.max(300, r.h + (e.clientY - r.startY)),
     });
-  }, [setBounds, win.id]);
+  }, [queueBounds]);
 
   const onResizePointerUp = useCallback(() => { resizeRef.current = null; }, []);
 
@@ -49,7 +66,7 @@ export function WindowFrame({ win, children }: { win: WindowState; children: Rea
   return (
     <section
       className="window-frame panel"
-      style={style}
+      style={{ ...style, display: win.minimized ? "none" : undefined }}
       onPointerDown={() => focus(win.id)}
       aria-label={win.title}
     >
@@ -70,7 +87,7 @@ export function WindowFrame({ win, children }: { win: WindowState; children: Rea
       </header>
 
       <div className="relative flex-1 overflow-hidden">
-        {children}
+        {(hasBeenShown || !win.minimized) && children}
       </div>
 
       {!win.maximized && (

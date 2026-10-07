@@ -164,7 +164,13 @@ export function WindowsProvider({ children }: { children: React.ReactNode }) {
   const [topZ, setTopZ] = useState(() => Math.max(10, ...windows.map((w) => w.z)));
 
   useEffect(() => {
-    localStorage.setItem(WINDOWS_KEY, JSON.stringify(windows));
+    const persist = () => localStorage.setItem(WINDOWS_KEY, JSON.stringify(windows));
+    const timer = setTimeout(persist, 200);
+    window.addEventListener("pagehide", persist);
+    return () => {
+      clearTimeout(timer);
+      window.removeEventListener("pagehide", persist);
+    };
   }, [windows]);
 
   const open = useCallback((module: string, title: string) => {

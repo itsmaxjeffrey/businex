@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { logger } from "hono/logger";
 import { serveStatic } from "@hono/node-server/serve-static";
 import { secureHeaders } from "hono/secure-headers";
+import { compress } from "hono/compress";
 import { config } from "./config";
 import type { Env } from "./context";
 import { jsonError, forbidden } from "./lib/errors";
@@ -25,6 +26,14 @@ export function createApp(): Hono<Env> {
   const app = new Hono<Env>();
 
   app.use("*", secureHeaders());
+  app.use("*", compress());
+  app.use("*", async (c, next) => {
+    await next();
+    if (c.req.path.startsWith("/api/")) c.header("Cache-Control", "no-store");
+    else if (c.req.path.startsWith("/assets/") && c.res.status === 200) {
+      c.header("Cache-Control", "public, max-age=31536000, immutable");
+    } else c.header("Cache-Control", "no-cache");
+  });
   app.use("*", async (c, next) => {
     const origin = c.req.header("origin");
     if (origin && origin !== config.webOrigin && !["GET", "HEAD", "OPTIONS"].includes(c.req.method)) {

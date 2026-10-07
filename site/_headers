@@ -1,0 +1,6 @@
+/app/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+/app/
+  Cache-Control: no-cache
+/app/index.html
+  Cache-Control: no-cache

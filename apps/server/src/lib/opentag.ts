@@ -35,7 +35,7 @@ export function saveOpenTagConfig(workspaceId: string, config: Partial<OpenTagCo
 }
 
 /**
- * Bridge to an open-tag daemon (https://github.com/fancyboi999/open-tag).
+ * Bridge to an open-tag daemon.
  *
  * Businex stays the business system of record: channel messages, tasks and
  * agent status live in Businex, while the daemon runs the actual agent

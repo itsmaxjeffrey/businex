@@ -1,6 +1,7 @@
 import { beforeAll, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
+import { gunzipSync } from "node:zlib";
 import path from "node:path";
 
 let app: { request: (path: string, init?: RequestInit) => Promise<Response> };
@@ -238,5 +239,22 @@ describe("project and task workflows", () => {
     expect((await call("GET", "/projects/tasks/" + task.data.id + "/comments", undefined, headers)).status).toBe(404);
     expect((await call("POST", "/projects/tasks/" + task.data.id + "/comments", { body: "Blocked" }, headers)).status).toBe(404);
     expect((await call("POST", "/projects/tasks", { title: "Blocked", projectId: project.data.id }, headers)).status).toBe(404);
+  });
+});
+
+
+describe("response delivery", () => {
+  it("compresses large responses without changing data and keeps private data uncached", async () => {
+    const body = "Business knowledge. ".repeat(1000);
+    const created = await call("POST", "/documents", { title: "Delivery test", body });
+    const res = await app.request("/api/documents/" + created.data.id, {
+      headers: { Authorization: "Bearer " + token, "X-Workspace-Id": ws, "Accept-Encoding": "gzip" },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("content-encoding")).toBe("gzip");
+    const compressed = new Uint8Array(await res.arrayBuffer());
+    expect(compressed.byteLength).toBeLessThan(body.length / 2);
+    expect(JSON.parse(gunzipSync(compressed).toString()).body).toBe(body);
   });
 });

@@ -1,18 +1,9 @@
-import type React from "react";
+import React, { lazy, memo } from "react";
 import {
   IconDashboard, IconCrm, IconProjects, IconDocs, IconCalendar,
   IconInvoice, IconChannels, IconAgent, IconTerminal, IconSettings,
 } from "../components/icons";
 import { DashboardModule } from "./Dashboard";
-import { CrmModule } from "./Crm";
-import { ProjectsModule } from "./Projects";
-import { DocumentsModule } from "./Documents";
-import { CalendarModule } from "./Calendar";
-import { InvoicesModule } from "./Invoices";
-import { ChannelsModule } from "./Channels";
-import { AgentsModule } from "./Agents";
-import { TerminalModule } from "./Terminal";
-import { SettingsModule } from "./Settings";
 
 export interface ModuleDef {
   id: string;
@@ -20,17 +11,25 @@ export interface ModuleDef {
   description: string;
   icon: React.ComponentType<{ size?: number; className?: string }>;
   component: React.ComponentType;
+  preload?: () => Promise<{ default: React.ComponentType }>;
+}
+
+// Share the preload promise with React.lazy, including pointer/focus prefetches.
+function deferred(load: () => Promise<{ default: React.ComponentType }>) {
+  let pending: ReturnType<typeof load> | undefined;
+  const preload = () => pending ??= load();
+  return { component: memo(lazy(preload)), preload };
 }
 
 export const modules: ModuleDef[] = [
-  { id: "dashboard", title: "Mission Control", description: "Business pulse: pipeline, work, activity", icon: IconDashboard, component: DashboardModule },
-  { id: "crm", title: "CRM", description: "Contacts, companies, deals pipeline", icon: IconCrm, component: CrmModule },
-  { id: "projects", title: "Projects", description: "Projects and kanban tasks", icon: IconProjects, component: ProjectsModule },
-  { id: "documents", title: "Documents", description: "Knowledge base with full-text search", icon: IconDocs, component: DocumentsModule },
-  { id: "calendar", title: "Calendar", description: "Events and scheduling", icon: IconCalendar, component: CalendarModule },
-  { id: "invoices", title: "Invoices", description: "Invoices, line items, status", icon: IconInvoice, component: InvoicesModule },
-  { id: "channels", title: "Channels", description: "open-tag style human + agent chat", icon: IconChannels, component: ChannelsModule },
-  { id: "agents", title: "Agents", description: "OpenClaw console and agent teammates", icon: IconAgent, component: AgentsModule },
-  { id: "terminal", title: "Terminal", description: "Real PTY terminals", icon: IconTerminal, component: TerminalModule },
-  { id: "settings", title: "Settings", description: "Workspace, members, API keys, audit", icon: IconSettings, component: SettingsModule },
+  { id: "dashboard", title: "Mission Control", description: "Business pulse: pipeline, work, activity", icon: IconDashboard, component: memo(DashboardModule) },
+  { id: "crm", title: "CRM", description: "Contacts, companies, deals pipeline", icon: IconCrm, ...deferred(() => import("./Crm").then(m => ({ default: m.CrmModule }))) },
+  { id: "projects", title: "Projects", description: "Projects and kanban tasks", icon: IconProjects, ...deferred(() => import("./Projects").then(m => ({ default: m.ProjectsModule }))) },
+  { id: "documents", title: "Documents", description: "Knowledge base with full-text search", icon: IconDocs, ...deferred(() => import("./Documents").then(m => ({ default: m.DocumentsModule }))) },
+  { id: "calendar", title: "Calendar", description: "Events and scheduling", icon: IconCalendar, ...deferred(() => import("./Calendar").then(m => ({ default: m.CalendarModule }))) },
+  { id: "invoices", title: "Invoices", description: "Invoices, line items, status", icon: IconInvoice, ...deferred(() => import("./Invoices").then(m => ({ default: m.InvoicesModule }))) },
+  { id: "channels", title: "Channels", description: "open-tag style human + agent chat", icon: IconChannels, ...deferred(() => import("./Channels").then(m => ({ default: m.ChannelsModule }))) },
+  { id: "agents", title: "Agents", description: "OpenClaw console and agent teammates", icon: IconAgent, ...deferred(() => import("./Agents").then(m => ({ default: m.AgentsModule }))) },
+  { id: "terminal", title: "Terminal", description: "Real PTY terminals", icon: IconTerminal, ...deferred(() => import("./Terminal").then(m => ({ default: m.TerminalModule }))) },
+  { id: "settings", title: "Settings", description: "Workspace, members, API keys, audit", icon: IconSettings, ...deferred(() => import("./Settings").then(m => ({ default: m.SettingsModule }))) },
 ];

@@ -1,10 +1,22 @@
-import React, { useEffect, useState } from "react";
+import React, { Suspense, useEffect, useState } from "react";
 import { useSession, useWindows } from "../lib/store";
 import { modules } from "../modules/registry";
 import { WindowFrame } from "./Window";
 import { CommandPalette } from "./CommandPalette";
-import { Avatar } from "../components/ui";
+import { Avatar, Spinner } from "../components/ui";
 import { IconSearch, IconSun, IconMoon } from "../components/icons";
+
+class ModuleBoundary extends React.Component<{ label: string; children: React.ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  render() {
+    if (this.state.failed) return <div className="p-6">
+      <p>Couldn't open {this.props.label}. Reload the page to try again.</p>
+      <button className="btn btn-primary mt-3" onClick={() => window.location.reload()}>Reload page</button>
+    </div>;
+    return this.props.children;
+  }
+}
 
 function Clock() {
   const [now, setNow] = useState(new Date());
@@ -101,6 +113,8 @@ export function Desktop() {
               key={m.id}
               className={"rail-item " + (isOpen ? "active" : "")}
               title={m.title}
+              onPointerEnter={() => { void m.preload?.().catch(() => {}); }}
+              onFocus={() => { void m.preload?.().catch(() => {}); }}
               onClick={() => open(m.id, m.title)}
             >
               <m.icon size={19} />
@@ -111,12 +125,16 @@ export function Desktop() {
 
       {/* Window layer */}
       <main className="absolute bottom-[70px] left-[64px] right-0 top-[52px]">
-        {windows.filter((w) => !w.minimized).map((win) => {
+        {windows.map((win) => {
           const mod = modules.find((m) => m.id === win.module);
           if (!mod) return null;
           return (
             <WindowFrame key={win.id} win={win}>
-              <mod.component />
+              <ModuleBoundary label={mod.title}>
+              <Suspense fallback={<Spinner label={"Opening " + mod.title + "…"} />}>
+                <mod.component />
+              </Suspense>
+              </ModuleBoundary>
             </WindowFrame>
           );
         })}
@@ -135,6 +153,8 @@ export function Desktop() {
               className="rail-item"
               style={{ width: 38, height: 38, opacity: win ? 1 : 0.55 }}
               title={m.title}
+              onPointerEnter={() => { void m.preload?.().catch(() => {}); }}
+              onFocus={() => { void m.preload?.().catch(() => {}); }}
               onClick={() => (win ? (win.minimized ? open(m.id, m.title) : focus(win.id)) : open(m.id, m.title))}
             >
               <m.icon size={17} />

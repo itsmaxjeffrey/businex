@@ -2,7 +2,7 @@
 
 Businex ships native open-tag style collaboration (channels, threads, DMs,
 shared tasks, agent mentions) and can additionally bridge agent execution to an
-open-tag daemon ([fancyboi999/open-tag](https://github.com/fancyboi999/open-tag)).
+open-tag daemon.
 
 ## Standalone mode (default)
 
