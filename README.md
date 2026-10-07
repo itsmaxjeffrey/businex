@@ -98,6 +98,12 @@ npm test           # unit + integration tests
 npm run smoke      # end-to-end smoke test against a running server
 ```
 
+## Performance
+
+Modules load on demand, windows retain their state when minimized, and production assets use
+compression and fingerprinted caching. The first optimization pass reduced the default desktop's
+startup JavaScript by approximately 55%. See [measurements and verification](docs/performance.md).
+
 ## Production hosting
 
 The working app can be deployed with persistent SQLite storage using the included Docker image
