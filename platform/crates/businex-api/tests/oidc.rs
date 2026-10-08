@@ -45,6 +45,10 @@ struct MockSpec {
     wrong_key: bool,
     expected_challenge: Option<String>,
     seen_verifier: Option<String>,
+    /// Discovery endpoint hit counter: proves cache and refresh behaviour.
+    discoveries: u32,
+    /// Serve the rotated fixture key from the JWKS endpoint.
+    jwks_serves_wrong_key: bool,
 }
 
 impl MockSpec {
@@ -60,6 +64,8 @@ impl MockSpec {
             wrong_key: false,
             expected_challenge: None,
             seen_verifier: None,
+            discoveries: 0,
+            jwks_serves_wrong_key: false,
         }
     }
 }
@@ -81,6 +87,7 @@ fn signing_key(wrong: bool) -> CoreRsaPrivateSigningKey {
 }
 
 async fn discovery(State(st): State<MockState>) -> Json<Value> {
+    st.spec.lock().expect("mock spec").discoveries += 1;
     let issuer = st.base.clone();
     Json(json!({
         "issuer": issuer,
@@ -93,8 +100,10 @@ async fn discovery(State(st): State<MockState>) -> Json<Value> {
     }))
 }
 
-async fn jwks() -> Json<Value> {
-    let key = signing_key(false);
+async fn jwks(State(st): State<MockState>) -> Json<Value> {
+    // Advertise the rotated key when a test simulates provider key rotation.
+    let rotated = st.spec.lock().expect("mock spec").jwks_serves_wrong_key;
+    let key = signing_key(rotated);
     let set = CoreJsonWebKeySet::new(vec![key.as_verification_key()]);
     Json(serde_json::to_value(set).expect("jwk json"))
 }
@@ -349,7 +358,7 @@ async fn valid_login_creates_verified_user_and_session() {
     let row: Option<(String,)> = sqlx::query_as(
         "SELECT user_id::text FROM oidc_identities WHERE issuer = $1 AND subject = $2",
     )
-    .bind(issuer.trim_end_matches('/'))
+    .bind(issuer.as_str())
     .bind("user-42")
     .fetch_optional(&db.pool)
     .await
@@ -630,7 +639,7 @@ async fn same_email_across_issuers_conflicts_without_linking() {
     );
 
     let linked: (i64,) = sqlx::query_as("SELECT count(*) FROM oidc_identities WHERE issuer = $1")
-        .bind(issuer_b.trim_end_matches('/'))
+        .bind(issuer_b.as_str())
         .fetch_one(&db.pool)
         .await
         .expect("identity count");
@@ -645,11 +654,51 @@ async fn same_email_across_issuers_conflicts_without_linking() {
 
     let owner: (String,) =
         sqlx::query_as("SELECT user_id::text FROM oidc_identities WHERE issuer = $1")
-            .bind(issuer_a.trim_end_matches('/'))
+            .bind(issuer_a.as_str())
             .fetch_one(&db.pool)
             .await
             .expect("first identity row");
     assert_eq!(owner.0, first_user);
+}
+
+#[tokio::test]
+async fn rotated_jwks_is_refreshed_without_stale_cache() {
+    let db = TestDb::new().await;
+    let (issuer, spec) = mock_provider();
+    let app = app_for(&db, &issuer).await;
+    let mut client = Client::new(app);
+
+    // First login: discovery runs once and the metadata cache holds the
+    // original signing key.
+    let (state, nonce, _challenge) = start_flow(&mut client).await;
+    spec.lock().unwrap().nonce = nonce;
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(spec.lock().unwrap().discoveries, 1);
+
+    // The provider rotates its signing key: new tokens are signed with the
+    // rotated key and the JWKS endpoint advertises only that key.
+    {
+        let mut s = spec.lock().unwrap();
+        s.wrong_key = true;
+        s.jwks_serves_wrong_key = true;
+    }
+    let (state, nonce, _challenge) = start_flow(&mut client).await;
+    spec.lock().unwrap().nonce = nonce;
+    let (status, body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rotated signing key must be absorbed via bounded re-discovery: {}",
+        body
+    );
+    // Exactly one extra discovery: the retry refreshes the cache once, then
+    // verification must succeed — no unbounded refetch loop.
+    assert_eq!(spec.lock().unwrap().discoveries, 2);
 }
 
 #[tokio::test]

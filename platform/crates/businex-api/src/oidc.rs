@@ -98,10 +98,14 @@ impl std::fmt::Debug for OidcConfig {
 }
 
 impl OidcConfig {
-    /// Stable mapping key for the issuer. Trailing slashes are normalized so
-    /// the same provider always maps to the same key.
+    /// Identity mapping key for the issuer: the exact configured string.
+    ///
+    /// Issuer identifiers are compared byte-for-byte (OIDC Core simple string
+    /// comparison), so a trailing slash marks a different issuer and is never
+    /// normalized away — normalization here would let two issuer strings
+    /// collapse onto one account namespace.
     pub fn issuer_key(&self) -> String {
-        self.issuer.trim().trim_end_matches('/').to_string()
+        self.issuer.clone()
     }
 }
 
@@ -115,6 +119,11 @@ pub enum OidcConfigError {
     CredentialUnreadable,
     /// The credential file is readable but holds no material.
     CredentialEmpty,
+    /// The issuer setting is not an absolute http(s) URL without query or
+    /// fragment.
+    InvalidIssuer,
+    /// The redirect URL setting is not an absolute http(s) URL.
+    InvalidRedirectUrl,
 }
 
 impl std::fmt::Display for OidcConfigError {
@@ -123,6 +132,8 @@ impl std::fmt::Display for OidcConfigError {
             Self::Partial => "oidc configuration incomplete",
             Self::CredentialUnreadable => "oidc credential file is not readable",
             Self::CredentialEmpty => "oidc credential file is empty",
+            Self::InvalidIssuer => "oidc issuer is not a valid url",
+            Self::InvalidRedirectUrl => "oidc redirect url is not a valid url",
         };
         f.write_str(text)
     }
@@ -145,6 +156,21 @@ pub fn load_from_env() -> Result<Option<OidcRuntime>, OidcConfigError> {
         |key| std::env::var(key).ok(),
         |path| std::fs::read_to_string(path),
     )
+}
+
+/// Startup URL validation. The error paths never echo the configured value.
+///
+/// `bare` additionally forbids a query or fragment: OIDC Core 1.0 requires an
+/// issuer identifier without either, and RFC 6749 forbids fragments in
+/// redirect URIs.
+fn valid_url(raw: &str, bare: bool) -> bool {
+    let Ok(url) = openidconnect::url::Url::parse(raw) else {
+        return false;
+    };
+    let scheme_ok = url.scheme() == "https" || url.scheme() == "http";
+    let clean = url.fragment().is_none() && url.username().is_empty() && url.password().is_none();
+    let bare_ok = !bare || url.query().is_none();
+    scheme_ok && url.host_str().is_some() && clean && bare_ok
 }
 
 /// Testable core of [`load_from_env`]: lookup and credential reading are
@@ -174,6 +200,18 @@ where
             return Err(OidcConfigError::Partial);
         }
     }
+    // Strip stray padding only. The issuer identity itself is stored and
+    // compared exactly as configured — no slash or case normalization.
+    let issuer = issuer.trim().to_string();
+    let client_id = client_id.trim().to_string();
+    let redirect_url = redirect_url.trim().to_string();
+    let cred_file = cred_file.trim().to_string();
+    if !valid_url(&issuer, true) {
+        return Err(OidcConfigError::InvalidIssuer);
+    }
+    if !valid_url(&redirect_url, false) {
+        return Err(OidcConfigError::InvalidRedirectUrl);
+    }
     let material = read_credential(&cred_file)
         .map_err(|_| OidcConfigError::CredentialUnreadable)?
         .trim()
@@ -194,8 +232,20 @@ where
 pub struct OidcRuntime {
     pub config: OidcConfig,
     pub http: reqwest::Client,
-    provider: Arc<tokio::sync::RwLock<Option<Arc<CoreProviderMetadata>>>>,
+    provider: Arc<tokio::sync::RwLock<Option<CachedProvider>>>,
 }
+
+/// Cached discovery metadata with an expiry: exactly one entry, replaced in
+/// place, and re-fetched once when verification fails so provider key
+/// rotation is picked up without a restart.
+struct CachedProvider {
+    fetched_at: std::time::Instant,
+    metadata: Arc<CoreProviderMetadata>,
+}
+
+/// Discovery cache lifetime. Bounded on purpose: provider metadata and JWKS
+/// go stale, so a forever-cache pins rotated signing keys.
+const PROVIDER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
 
 impl std::fmt::Debug for OidcRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -210,6 +260,10 @@ impl OidcRuntime {
         let http = reqwest::Client::builder()
             // Following redirects on server-side calls opens SSRF holes.
             .redirect(reqwest::redirect::Policy::none())
+            // Bounded calls: a slow or hung provider must never hang a login
+            // request past these limits.
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("oidc http client");
         OidcRuntime {
@@ -219,12 +273,22 @@ impl OidcRuntime {
         }
     }
 
-    /// Discover (and cache) provider metadata including the JWKS used later
-    /// for signature verification. Failure is reported without response text.
+    /// Provider metadata (including the JWKS used for verification), served
+    /// from a bounded cache. Failure is reported without response text.
     async fn provider(&self) -> Result<Arc<CoreProviderMetadata>, Response> {
-        if let Some(cached) = self.provider.read().await.clone() {
-            return Ok(cached);
+        {
+            let cached = self.provider.read().await;
+            if let Some(entry) = cached.as_ref() {
+                if entry.fetched_at.elapsed() < PROVIDER_CACHE_TTL {
+                    return Ok(entry.metadata.clone());
+                }
+            }
         }
+        self.fetch_provider().await
+    }
+
+    /// Discover provider metadata and replace the cache entry.
+    async fn fetch_provider(&self) -> Result<Arc<CoreProviderMetadata>, Response> {
         let issuer = IssuerUrl::new(self.config.issuer.clone()).map_err(|_| {
             error_response(&Error::Invalid {
                 message: "oidc issuer is not a valid url".into(),
@@ -238,8 +302,18 @@ impl OidcRuntime {
             })?;
         let shared = Arc::new(metadata);
         let mut guard = self.provider.write().await;
-        *guard = Some(shared.clone());
+        *guard = Some(CachedProvider {
+            fetched_at: std::time::Instant::now(),
+            metadata: shared.clone(),
+        });
         Ok(shared)
+    }
+
+    /// Drop the cache so the next lookup re-discovers. Used at most once per
+    /// callback when signature verification fails — that is how signing-key
+    /// rotation is absorbed without a process restart.
+    async fn invalidate_provider(&self) {
+        *self.provider.write().await = None;
     }
 
     /// Build the OIDC client from discovered metadata.
@@ -255,6 +329,27 @@ impl OidcRuntime {
             Some(ClientSecret::new(self.config.auth_material.expose())),
         )
         .set_redirect_uri(redirect))
+    }
+}
+
+/// Owned snapshot of the verified claims. Taking only what provisioning
+/// needs keeps the verification-retry path free of borrow ties to any single
+/// client instance.
+struct VerifiedClaims {
+    subject: String,
+    email: Option<String>,
+    email_verified: bool,
+    preferred_username: Option<String>,
+}
+
+impl From<&CoreIdTokenClaims> for VerifiedClaims {
+    fn from(claims: &CoreIdTokenClaims) -> Self {
+        VerifiedClaims {
+            subject: claims.subject().to_string(),
+            email: claims.email().map(|value| value.to_string()),
+            email_verified: claims.email_verified() == Some(true),
+            preferred_username: claims.preferred_username().map(|value| value.to_string()),
+        }
     }
 }
 
@@ -513,18 +608,36 @@ async fn callback(
     })?;
 
     // Library verification: signature, issuer, audience, expiry and nonce.
+    // Providers may rotate signing keys; when verification fails against the
+    // cached JWKS we drop the cache, re-discover once, and verify again. The
+    // retry relaxes nothing — the token must pass the same full verification.
     let nonce = Nonce::new(stored_nonce);
-    let claims: &CoreIdTokenClaims =
-        idt.claims(&client.id_token_verifier(), &nonce)
-            .map_err(|_| {
-                tracing::warn!(stage = "verify", "oidc token verification failed");
-                error_response(&Error::Forbidden {
-                    action: "oidc_login".into(),
-                    reason: "identity verification failed".into(),
-                })
-            })?;
+    // Snapshot the claims as owned values inside the statement so swapping
+    // clients on the retry path cannot create borrow-of-temporary errors.
+    let mut verified = idt
+        .claims(&client.id_token_verifier(), &nonce)
+        .map(VerifiedClaims::from);
+    if verified.is_err() {
+        tracing::warn!(
+            stage = "verify",
+            "oidc verification failed; re-discovering provider once"
+        );
+        oidc.invalidate_provider().await;
+        let provider = oidc.fetch_provider().await?;
+        let client = oidc.client(&provider)?;
+        verified = idt
+            .claims(&client.id_token_verifier(), &nonce)
+            .map(VerifiedClaims::from);
+    }
+    let claims = verified.map_err(|_| {
+        tracing::warn!(stage = "verify", "oidc token verification failed");
+        error_response(&Error::Forbidden {
+            action: "oidc_login".into(),
+            reason: "identity verification failed".into(),
+        })
+    })?;
 
-    let subject = claims.subject().to_string();
+    let subject = claims.subject.clone();
     let issuer = oidc.config.issuer_key();
 
     // Composite mapping: identity is (issuer, subject), never subject alone.
@@ -550,9 +663,10 @@ async fn callback(
             // Provisioning needs a provider-VERIFIED e-mail; unverified
             // addresses are never used for identity or invitation matching.
             let verified_email = claims
-                .email()
-                .filter(|_| claims.email_verified() == Some(true))
-                .map(|e| e.to_string().to_lowercase());
+                .email
+                .as_ref()
+                .filter(|_| claims.email_verified)
+                .map(|e| e.to_lowercase());
             let email = verified_email.ok_or_else(|| {
                 error_response(&Error::Forbidden {
                     action: "oidc_login".into(),
@@ -560,8 +674,8 @@ async fn callback(
                 })
             })?;
             let display_name = claims
-                .preferred_username()
-                .map(|u| u.to_string())
+                .preferred_username
+                .clone()
                 .unwrap_or_else(|| email.clone());
             let id = Uuid::new_v4();
             let mut tx = state
@@ -638,8 +752,8 @@ async fn callback(
 #[cfg(test)]
 mod tests {
     use super::{
-        ct_eq, load_with, safe_return_to, OidcConfigError, OIDC_CLIENT_ID_KEY, OIDC_CRED_FILE_KEY,
-        OIDC_ISSUER_KEY, OIDC_REDIRECT_KEY,
+        ct_eq, load_with, safe_return_to, ClientCred, OidcConfig, OidcConfigError,
+        OIDC_CLIENT_ID_KEY, OIDC_CRED_FILE_KEY, OIDC_ISSUER_KEY, OIDC_REDIRECT_KEY,
     };
 
     fn lookup(pairs: Vec<(&str, String)>) -> impl Fn(&str) -> Option<String> {
@@ -717,6 +831,59 @@ mod tests {
             "credential leaked: {}",
             debug
         );
+    }
+
+    /// The identity key is the exact configured issuer string. Trailing-slash
+    /// variants must stay distinct account namespaces or two issuers could
+    /// collapse onto one set of accounts.
+    #[test]
+    fn issuer_key_slash_variants_do_not_collide() {
+        let mk = |issuer: &str| OidcConfig {
+            issuer: issuer.to_string(),
+            client_id: "client-1".to_string(),
+            auth_material: ClientCred::new(String::from("cred")),
+            redirect_url: "https://app.example/auth/oidc/callback".to_string(),
+        };
+        assert_eq!(
+            mk("https://idp.example/").issuer_key(),
+            "https://idp.example/"
+        );
+        assert_ne!(
+            mk("https://idp.example").issuer_key(),
+            mk("https://idp.example/").issuer_key()
+        );
+    }
+
+    #[tokio::test]
+    async fn config_rejects_invalid_issuer_url() {
+        let mut settings = full_settings();
+        settings[0].1 = String::from("not a url");
+        let runtime = load_with(lookup(settings), |_| Ok(String::from("x")));
+        assert!(matches!(runtime, Err(OidcConfigError::InvalidIssuer)));
+    }
+
+    #[tokio::test]
+    async fn config_rejects_issuer_with_query_string() {
+        let mut settings = full_settings();
+        settings[0].1 = String::from("https://idp.example/auth?tenant=1");
+        let runtime = load_with(lookup(settings), |_| Ok(String::from("x")));
+        assert!(matches!(runtime, Err(OidcConfigError::InvalidIssuer)));
+    }
+
+    #[tokio::test]
+    async fn config_rejects_invalid_redirect_url() {
+        let mut settings = full_settings();
+        settings[2].1 = String::from("javascript:alert(1)");
+        let runtime = load_with(lookup(settings), |_| Ok(String::from("x")));
+        assert!(matches!(runtime, Err(OidcConfigError::InvalidRedirectUrl)));
+    }
+
+    #[tokio::test]
+    async fn config_rejects_redirect_url_with_fragment() {
+        let mut settings = full_settings();
+        settings[2].1 = String::from("https://app.example/cb#frag");
+        let runtime = load_with(lookup(settings), |_| Ok(String::from("x")));
+        assert!(matches!(runtime, Err(OidcConfigError::InvalidRedirectUrl)));
     }
 
     #[test]
