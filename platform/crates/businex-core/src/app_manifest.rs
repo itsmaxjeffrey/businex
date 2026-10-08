@@ -6,7 +6,7 @@
 //! permissions are errors, never silently ignored — so a malformed manifest
 //! can never reach the record layer or the runtime.
 
-use crate::{Error, Permission, Result};
+use crate::{Error, Permission, Result, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -71,11 +71,59 @@ pub struct FieldDef {
     pub unique: bool,
 }
 
+/// Minimum company role required for each record action on one entity.
+///
+/// Entity rules only ever narrow the company-wide permission grants — the
+/// permission check still runs first — so a manifest can keep warehouse
+/// members on `item` records while `stocktake` writes stay manager-only
+/// without granting anyone anything new.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityAccess {
+    /// Role required to read records. Default: viewer.
+    #[serde(default = "default_read_role")]
+    pub read: Role,
+    /// Role required to create or update records. Default: member.
+    #[serde(default = "default_write_role")]
+    pub write: Role,
+    /// Role required to delete records. Default: manager.
+    #[serde(default = "default_delete_role")]
+    pub delete: Role,
+}
+
+fn default_read_role() -> Role {
+    Role::Viewer
+}
+
+fn default_write_role() -> Role {
+    Role::Member
+}
+
+fn default_delete_role() -> Role {
+    Role::Manager
+}
+
+impl Default for EntityAccess {
+    fn default() -> Self {
+        // The defaults mirror the plain permission mapping exactly, so a
+        // manifest that omits `access` behaves as it always has.
+        EntityAccess {
+            read: Role::Viewer,
+            write: Role::Member,
+            delete: Role::Manager,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntityDef {
     pub name: String,
     pub fields: Vec<FieldDef>,
+    /// Per-action role floor for this entity's records. An omitted action
+    /// falls back to the platform default above.
+    #[serde(default)]
+    pub access: EntityAccess,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

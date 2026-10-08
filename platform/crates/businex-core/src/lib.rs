@@ -363,6 +363,13 @@ pub enum Error {
     Conflict { message: String },
     #[error("invalid input: {message}")]
     Invalid { message: String },
+    /// A dependency outside the platform failed or produced unusable output.
+    /// The message is fixed and sanitized; upstream bodies never appear.
+    #[error("upstream error: {message}")]
+    Upstream { message: String },
+    /// A platform feature is present but not configured on this deployment.
+    #[error("unavailable: {message}")]
+    Unavailable { message: String },
     #[error("internal error")]
     Internal(#[from] Box<dyn std::error::Error + Send + Sync>),
 }

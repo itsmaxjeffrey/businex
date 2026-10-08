@@ -5,8 +5,13 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use base64::Engine as _;
+use businex_api::builder::{GenerateOutcome, GenerateRequest, ManifestGenerator};
 use businex_api::{router, AppConfig, AppState};
 use businex_db::TestDb;
+use businex_models::{Cost, MasterKey, ModelError, Usage};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use businex_events::{Relay, RelayOptions};
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -84,6 +89,10 @@ impl Client {
 
     async fn patch(&mut self, uri: &str, body: Value) -> (StatusCode, Value) {
         self.call("PATCH", uri, Some(body)).await
+    }
+
+    async fn put(&mut self, uri: &str, body: Value) -> (StatusCode, Value) {
+        self.call("PUT", uri, Some(body)).await
     }
 
     async fn delete(&mut self, uri: &str) -> (StatusCode, Value) {
@@ -398,4 +407,672 @@ async fn app_management_requires_admin_and_stays_inside_the_tenant() {
         .await;
     assert_eq!(status, StatusCode::OK, "member record write: {}", body);
     let _ = owner_addr;
+}
+
+// Two writers racing on the same unique value must produce exactly one
+// record: the transaction-scoped lock in ensure_unique serializes the
+// check-and-write so the loser sees the winner's row.
+#[tokio::test]
+async fn simultaneous_unique_writers_admit_exactly_one_record() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+
+    let mut first = Client::new(owner.app.clone());
+    first.cookie = owner.cookie.clone();
+    let mut second = Client::new(owner.app.clone());
+    second.cookie = owner.cookie.clone();
+    let (a, b) = tokio::join!(
+        first.post(&records, json!({"data": {"sku": "RACE-1", "qty": 1}})),
+        second.post(&records, json!({"data": {"sku": "RACE-1", "qty": 2}}))
+    );
+    let statuses = [a.0, b.0];
+    let winners = statuses.iter().filter(|s| **s == StatusCode::OK).count();
+    assert_eq!(winners, 1, "exactly one writer wins: {:?}", statuses);
+    assert!(
+        statuses.contains(&StatusCode::CONFLICT),
+        "the loser gets a conflict: {:?}",
+        statuses
+    );
+
+    // The store holds exactly one record for that barcode.
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+}
+
+// A version switch may never strand retained data: incompatible targets are
+// refused up front and the install stays exactly where it was.
+#[tokio::test]
+async fn version_switches_refuse_changes_that_invalidate_retained_records() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+    let (status, body) = owner
+        .post(&records, json!({"data": {"sku": "A-1", "qty": 5}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    // v2 retypes qty from number to text: the retained record no longer fits.
+    let mut breaking = manifest_v1();
+    breaking["entities"][0]["fields"][1]["type"] = json!("text");
+    let (status, body) = owner
+        .post(
+            &format!("{}/{}/versions", apps, app_id),
+            json!({"manifest": breaking}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let (status, body) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 2}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("do not fit"),
+        "{}",
+        body
+    );
+
+    // Data is untouched and no transition was recorded.
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["records"][0]["data"]["qty"], 5);
+    let (status, body) = owner.get(&format!("{}/{}/history", apps, app_id)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["history"].as_array().expect("history").len(),
+        1,
+        "only the original install: {}",
+        body
+    );
+
+    // A compatible v3 (adds an optional field) upgrades normally.
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/versions", apps, app_id),
+            json!({"manifest": manifest_v2()}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 3}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    // Rollback is refused the moment data carries fields v1 rejects.
+    let (status, body) = owner
+        .post(
+            &records,
+            json!({"data": {"sku": "B-2", "qty": 1, "note": "late"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let (status, body) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+}
+
+// Deleting is gated exactly like the other record paths: no live install, no
+// delete — and an unknown entity is a plain 404.
+#[tokio::test]
+async fn deleting_records_requires_a_live_install() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+    let (status, body) = owner
+        .post(&records, json!({"data": {"sku": "A-1", "qty": 5}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let record_id = body["id"].as_str().expect("record id").to_string();
+
+    let (status, body) = owner
+        .delete(&format!("{}/{}/install", apps, app_id))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    // Delete is refused while uninstalled, and the record survives.
+    let (status, body) = owner.delete(&format!("{}/{}", records, record_id)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["records"].as_array().expect("records").len(), 1);
+
+    // An entity the manifest does not declare is a 404, never a silent pass.
+    let (status, _) = owner
+        .delete(&format!("{}/{}/records/nope/{}", apps, app_id, record_id))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// Entity-action rules narrow the platform permissions per entity and action:
+// warehouse members write items but only managers write stocktakes, and only
+// admins delete them.
+#[tokio::test]
+async fn entity_action_rules_narrow_writes_by_role() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Warehouse").await;
+    let apps = format!("/api/companies/{}/apps", company);
+
+    let manifest = json!({
+        "schema_version": 1,
+        "name": "Warehouse",
+        "slug": "warehouse",
+        "kind": "schema",
+        "entities": [
+            {
+                "name": "item",
+                "fields": [{"name": "sku", "type": "text", "required": true}],
+                "access": {"read": "viewer", "write": "member", "delete": "manager"}
+            },
+            {
+                "name": "stocktake",
+                "fields": [{"name": "note", "type": "text", "required": true}],
+                "access": {"read": "manager", "write": "manager", "delete": "admin"}
+            }
+        ],
+        "permissions": ["records.read", "records.write", "records.delete"],
+        "routes": [],
+        "schedules": [],
+        "dependencies": []
+    });
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (mut member, member_addr) = register(router(state.clone()), "member").await;
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/invitations", company),
+            json!({"email": member_addr, "role": "member"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let token = body["token"].as_str().expect("token").to_string();
+    let (status, body) = member
+        .post("/api/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let (mut manager, manager_addr) = register(router(state.clone()), "manager").await;
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/invitations", company),
+            json!({"email": manager_addr, "role": "manager"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let token = body["token"].as_str().expect("token").to_string();
+    let (status, body) = manager
+        .post("/api/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let item = format!("{}/{}/records/item", apps, app_id);
+    let stocktake = format!("{}/{}/records/stocktake", apps, app_id);
+
+    // Members write items (their floor is the member role).
+    let (status, body) = member
+        .post(&item, json!({"data": {"sku": "A-1"}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    // But stocktakes are manager-only even though members hold records.write.
+    let (status, body) = member
+        .post(&stocktake, json!({"data": {"note": "try"}}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("manager"),
+        "{}",
+        body
+    );
+    let (status, _) = manager
+        .post(&stocktake, json!({"data": {"note": "counted"}}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The read floor narrows listing the same way.
+    let (status, body) = member.get(&stocktake).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+    let (status, _) = manager.get(&stocktake).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Deletes are admin-only here: the manager holds records.delete but the
+    // entity floor still refuses.
+    let (status, body) = manager.get(&stocktake).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let stock_id = body["records"][0]["id"].as_str().expect("id").to_string();
+    let (status, body) = manager
+        .delete(&format!("{}/{}", stocktake, stock_id))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+    let (status, _) = owner
+        .delete(&format!("{}/{}", stocktake, stock_id))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Model keys, budgets and the budget-aware generator.
+// ---------------------------------------------------------------------------
+
+/// Scripted generator standing in for the provider adapters. Records every
+/// call and the unsealed key it was handed.
+struct FakeGenerator {
+    text: String,
+    fail: bool,
+    calls: AtomicUsize,
+    seen_key: Mutex<Option<String>>,
+}
+
+impl FakeGenerator {
+    fn ok() -> Self {
+        FakeGenerator {
+            text: manifest_v1().to_string(),
+            fail: false,
+            calls: AtomicUsize::new(0),
+            seen_key: Mutex::new(None),
+        }
+    }
+
+    fn failing() -> Self {
+        FakeGenerator {
+            fail: true,
+            ..Self::ok()
+        }
+    }
+
+    fn garbage() -> Self {
+        FakeGenerator {
+            text: "not json at all".into(),
+            ..Self::ok()
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ManifestGenerator for FakeGenerator {
+    async fn generate(&self, request: GenerateRequest) -> Result<GenerateOutcome, ModelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.seen_key.lock().expect("lock") = Some(request.api_key);
+        if self.fail {
+            return Err(ModelError::Provider);
+        }
+        Ok(GenerateOutcome {
+            text: self.text.clone(),
+            usage: Some(Usage::of(100, 50)),
+            cost: Cost::Unknown,
+        })
+    }
+}
+
+async fn model_test_state(fake: Arc<FakeGenerator>) -> (TestDb, AppState) {
+    let (db, mut state) = test_state().await;
+    let encoded = base64::engine::general_purpose::STANDARD.encode([7u8; 32]);
+    state.master_key = Some(Arc::new(
+        MasterKey::from_base64(encoded).expect("test master key"),
+    ));
+    state.generator = fake;
+    (db, state)
+}
+
+// Key material is sealed before storage and never leaves the server: not in
+// create responses, not in listings, not in the row itself.
+#[tokio::test]
+async fn model_keys_are_sealed_at_rest_and_never_returned() {
+    let (db, state) = model_test_state(Arc::new(FakeGenerator::ok())).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let keys = format!("/api/companies/{}/model-keys", company);
+
+    let (status, body) = owner
+        .post(
+            &keys,
+            json!({"provider": "openai", "label": "default", "key": "sk-super-secret"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert!(!body.to_string().contains("sk-super-secret"), "{}", body);
+    let key_id = body["id"].as_str().expect("key id").to_string();
+
+    // The row holds nonce and ciphertext under the tenant pin, never plaintext.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    sqlx::query("SELECT set_config('businex.company_id', $1, false)")
+        .bind(&company)
+        .execute(&mut *conn)
+        .await
+        .expect("tenant pin");
+    let row: (Vec<u8>, Vec<u8>) =
+        sqlx::query_as("SELECT sealed_nonce, sealed_bytes FROM model_keys")
+            .fetch_one(&mut *conn)
+            .await
+            .expect("sealed row");
+    assert!(row.0.len() >= 12, "a nonce is stored");
+    assert!(
+        !String::from_utf8_lossy(&row.1).contains("sk-super-secret"),
+        "ciphertext must not leak the key"
+    );
+
+    // Listings carry metadata only.
+    let (status, body) = owner.get(&keys).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert!(!body.to_string().contains("sk-super-secret"), "{}", body);
+
+    // Revocation is recorded and takes the key out of service.
+    let (status, body) = owner.delete(&format!("{}/{}", keys, key_id)).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let (status, body) = owner.get(&keys).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert!(
+        body["keys"][0]["revoked_at"].is_string(),
+        "revocation is visible: {}",
+        body
+    );
+}
+
+// Managing provider keys is an admin action, not a member action.
+#[tokio::test]
+async fn model_keys_require_admin_rights() {
+    let (_db, state) = model_test_state(Arc::new(FakeGenerator::ok())).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let keys = format!("/api/companies/{}/model-keys", company);
+
+    let (mut member, member_addr) = register(router(state.clone()), "member").await;
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/invitations", company),
+            json!({"email": member_addr, "role": "member"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let token = body["token"].as_str().expect("token").to_string();
+    let (status, _) = member
+        .post("/api/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = member
+        .post(&keys, json!({"provider": "openai", "label": "default", "key": "sk-1"}))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+    let (status, body) = member.get(&keys).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+}
+
+// The full generate path: unsealed key reaches the generator, the app exists
+// afterwards, and the budget carries exactly the observed usage.
+#[tokio::test]
+async fn generate_settles_observed_usage_and_creates_the_app() {
+    let fake = Arc::new(FakeGenerator::ok());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let keys = format!("/api/companies/{}/model-keys", company);
+    let budget_uri = format!("/api/companies/{}/model-budget", company);
+
+    let (status, body) = owner
+        .post(
+            &keys,
+            json!({"provider": "openai", "label": "default", "key": "sk-secret-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let (status, body) = owner
+        .put(&budget_uri, json!({"max_tokens_per_period": 10000}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/apps/generate", company),
+            json!({
+                "description": "An inventory tracker with stock items",
+                "provider": "openai",
+                "model": "test-model",
+                "label": "default"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["app"]["version"], 1);
+    assert_eq!(body["usage"]["input_tokens"], 100);
+    assert_eq!(body["usage"]["output_tokens"], 50);
+    let app_id = body["app"]["id"].as_str().expect("app id").to_string();
+
+    // The generator was handed the unsealed key, exactly once.
+    assert_eq!(
+        fake.seen_key.lock().expect("lock").as_deref(),
+        Some("sk-secret-1")
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    // The generated app really exists in the company library.
+    let (status, body) = owner.get(&format!("/api/companies/{}/apps", company)).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert!(
+        body.to_string().contains(&app_id),
+        "generated app appears in the library: {}",
+        body
+    );
+
+    // Budget settled with observed usage: 150 tokens, nothing left reserved,
+    // and the unknown price counted as unknown rather than zero.
+    let (status, body) = owner.get(&budget_uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let budget = &body["budget"];
+    assert_eq!(budget["settled_tokens"], 150);
+    assert_eq!(budget["reserved_tokens"], 0);
+    assert_eq!(budget["unknown_cost_calls"], 1);
+}
+
+// A denied budget means the model is never called at all.
+#[tokio::test]
+async fn generate_is_denied_before_dispatch_when_the_budget_is_spent() {
+    let fake = Arc::new(FakeGenerator::ok());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let budget_uri = format!("/api/companies/{}/model-budget", company);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/model-keys", company),
+            json!({"provider": "openai", "label": "default", "key": "sk-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    // The pre-dispatch estimate for any description exceeds this cap.
+    let (status, body) = owner
+        .put(&budget_uri, json!({"max_tokens_per_period": 500}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/apps/generate", company),
+            json!({"description": "An inventory tracker", "provider": "openai", "model": "test-model"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("budget"),
+        "{}",
+        body
+    );
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "the model was never called"
+    );
+
+    let (status, body) = owner.get(&format!("/api/companies/{}/apps", company)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains("inventory"),
+        "no app was created: {}",
+        body
+    );
+    let (status, body) = owner.get(&budget_uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["budget"]["reserved_tokens"], 0, "{}", body);
+    assert_eq!(body["budget"]["settled_tokens"], 0, "{}", body);
+}
+
+// A failed model call releases its reservation: the company is never charged
+// for a call that did not happen.
+#[tokio::test]
+async fn a_failed_model_call_releases_its_reservation() {
+    let fake = Arc::new(FakeGenerator::failing());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let budget_uri = format!("/api/companies/{}/model-budget", company);
+
+    let (status, _) = owner
+        .post(
+            &format!("/api/companies/{}/model-keys", company),
+            json!({"provider": "openai", "label": "default", "key": "sk-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = owner
+        .put(&budget_uri, json!({"max_tokens_per_period": 10000}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/apps/generate", company),
+            json!({"description": "An inventory tracker", "provider": "openai", "model": "test-model"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", body);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    let (status, body) = owner.get(&budget_uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["budget"]["reserved_tokens"], 0, "{}", body);
+    assert_eq!(body["budget"]["settled_tokens"], 0, "{}", body);
+}
+
+// Unusable model output is still a real, charged call: the usage is settled
+// and the response says exactly what went wrong.
+#[tokio::test]
+async fn unusable_model_output_is_charged_and_refused() {
+    let fake = Arc::new(FakeGenerator::garbage());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let budget_uri = format!("/api/companies/{}/model-budget", company);
+
+    let (status, _) = owner
+        .post(
+            &format!("/api/companies/{}/model-keys", company),
+            json!({"provider": "openai", "label": "default", "key": "sk-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = owner
+        .put(&budget_uri, json!({"max_tokens_per_period": 10000}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/apps/generate", company),
+            json!({"description": "An inventory tracker", "provider": "openai", "model": "test-model"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", body);
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("valid app manifest"),
+        "{}",
+        body
+    );
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    // The call happened, so its usage is settled exactly once.
+    let (status, body) = owner.get(&budget_uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["budget"]["settled_tokens"], 150, "{}", body);
+    assert_eq!(body["budget"]["reserved_tokens"], 0, "{}", body);
+    assert_eq!(body["budget"]["unknown_cost_calls"], 1, "{}", body);
+
+    // But no half-built app was left behind.
+    let (status, body) = owner.get(&format!("/api/companies/{}/apps", company)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.to_string().contains("inventory"),
+        "no app was created: {}",
+        body
+    );
 }

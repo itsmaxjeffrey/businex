@@ -104,6 +104,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("oidc not configured; /api/auth/oidc/* stays disabled");
     }
 
+    // Deployment master key for sealed per-company model keys. Absent means
+    // model key management and generation stay disabled, never open.
+    let master_key = match std::env::var("BUSINEX_MODEL_MASTER_KEY") {
+        Ok(v) => match businex_models::MasterKey::from_base64(v) {
+            Ok(k) => Some(std::sync::Arc::new(k)),
+            Err(err) => {
+                tracing::error!(error = %err, "BUSINEX_MODEL_MASTER_KEY is invalid");
+                return Err(err.into());
+            }
+        },
+        Err(_) => None,
+    };
+    if master_key.is_none() {
+        tracing::info!(
+            "model master key not configured; model keys and generation stay disabled"
+        );
+    }
+
     let app = router(AppState {
         pool: pool.clone(),
         relay: relay.clone(),
@@ -111,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config,
         rate_limiter,
         oidc: oidc_rt,
+        master_key,
+        generator: std::sync::Arc::new(businex_api::builder::ProviderGenerator),
     });
 
     let addr = format!("{}:{}", host, port);

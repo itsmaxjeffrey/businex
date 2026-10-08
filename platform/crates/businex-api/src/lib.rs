@@ -17,10 +17,12 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::TraceLayer;
 
 pub mod auth;
+pub mod builder;
 pub mod oidc;
 pub mod ratelimit;
 pub mod routes_apps;
 pub mod routes_identity;
+pub mod routes_models;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -51,6 +53,12 @@ pub struct AppState {
     pub config: AppConfig,
     pub rate_limiter: std::sync::Arc<dyn ratelimit::RateLimiter>,
     pub oidc: Option<oidc::OidcRuntime>,
+    /// Deployment master key for sealed per-company model keys. Absent on
+    /// deployments without model features; the routes then fail closed.
+    pub master_key: Option<std::sync::Arc<businex_models::MasterKey>>,
+    /// Model call seam: production uses the provider adapters, tests inject
+    /// a scripted generator.
+    pub generator: std::sync::Arc<dyn builder::ManifestGenerator>,
 }
 
 impl AppState {
@@ -63,6 +71,8 @@ impl AppState {
             config,
             rate_limiter: std::sync::Arc::new(ratelimit::MemoryRateLimiter::new()),
             oidc: None,
+            master_key: None,
+            generator: std::sync::Arc::new(builder::ProviderGenerator),
         }
     }
 }
@@ -75,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(api_health))
         .merge(routes_identity::router())
         .merge(routes_apps::router())
+        .merge(routes_models::router())
         .merge(oidc::router())
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
@@ -160,6 +171,10 @@ pub fn error_response(err: &businex_core::Error) -> Response {
         }
         businex_core::Error::Conflict { message } => (StatusCode::CONFLICT, message.clone()),
         businex_core::Error::Invalid { message } => (StatusCode::BAD_REQUEST, message.clone()),
+        businex_core::Error::Upstream { message } => (StatusCode::BAD_GATEWAY, message.clone()),
+        businex_core::Error::Unavailable { message } => {
+            (StatusCode::SERVICE_UNAVAILABLE, message.clone())
+        }
         businex_core::Error::Internal(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "internal error".into())
         }

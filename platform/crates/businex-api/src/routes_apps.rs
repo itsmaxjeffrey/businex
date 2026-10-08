@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use businex_core::app_manifest::{validate_record, AppManifest};
-use businex_core::{Error, Permission};
+use businex_core::{Authorization, Error, Permission, Role};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -46,7 +46,7 @@ pub fn router() -> Router<AppState> {
         )
 }
 
-fn db_err(e: sqlx::Error) -> Response {
+pub(crate) fn db_err(e: sqlx::Error) -> Response {
     // Logged server-side for diagnosis; the client response stays a fixed
     // sanitized string.
     tracing::error!(error = ?e, "app platform database error");
@@ -60,7 +60,7 @@ fn db_err(e: sqlx::Error) -> Response {
     }
 }
 
-fn tx_err(e: sqlx::Error) -> Response {
+pub(crate) fn tx_err(e: sqlx::Error) -> Response {
     tracing::error!(error = ?e, "app platform transaction error");
     error_response(&Error::Internal("database error".into()))
 }
@@ -81,6 +81,46 @@ fn manifest_hash(manifest: &AppManifest) -> Result<String, Response> {
     Ok(hex::encode(Sha256::digest(canonical.as_bytes())))
 }
 
+/// Insert the app row and its immutable version-1 manifest row inside the
+/// caller's transaction. Shared by direct creation and model-driven
+/// generation so both paths store byte-identical rows.
+pub(crate) async fn insert_app_with_manifest(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    actor_id: Uuid,
+    manifest: &AppManifest,
+) -> Result<Uuid, Response> {
+    let bundle_hash = manifest_hash(manifest)?;
+    let manifest_json = serde_json::to_value(manifest)
+        .map_err(|_| error_response(&Error::Internal("manifest serialization failed".into())))?;
+    let app_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO apps (id, company_id, slug, name, kind, created_by)\n         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(app_id)
+    .bind(company_id)
+    .bind(manifest.slug.as_str())
+    .bind(manifest.name.as_str())
+    .bind(manifest.kind.as_str())
+    .bind(actor_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    sqlx::query(
+        "INSERT INTO app_versions (id, app_id, company_id, version, manifest, bundle_hash, created_by)\n         VALUES ($1, $2, $3, 1, $4, $5, $6)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(app_id)
+    .bind(company_id)
+    .bind(manifest_json)
+    .bind(bundle_hash)
+    .bind(actor_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    Ok(app_id)
+}
+
 /// Create a new app in the company library together with its first manifest
 /// version. The version row is immutable from here on.
 async fn create_app(
@@ -93,39 +133,11 @@ async fn create_app(
     let auth = authorize(&state, &user, company_id, Permission::AppsManage, "*").await?;
     let manifest = input.manifest;
     manifest.validate().map_err(|e| error_response(&e))?;
-    let bundle_hash = manifest_hash(&manifest)?;
-    let manifest_json = serde_json::to_value(&manifest)
-        .map_err(|_| error_response(&Error::Internal("manifest serialization failed".into())))?;
-
     let ctx = businex_db::CompanyContext::with_actor(company_id, user.id);
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
-    let app_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO apps (id, company_id, slug, name, kind, created_by)\n         VALUES ($1, $2, $3, $4, $5, $6)",
-    )
-    .bind(app_id)
-    .bind(company_id)
-    .bind(manifest.slug.as_str())
-    .bind(manifest.name.as_str())
-    .bind(manifest.kind.as_str())
-    .bind(user.id)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
-    sqlx::query(
-        "INSERT INTO app_versions (id, app_id, company_id, version, manifest, bundle_hash, created_by)\n         VALUES ($1, $2, $3, 1, $4, $5, $6)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(app_id)
-    .bind(company_id)
-    .bind(manifest_json)
-    .bind(bundle_hash)
-    .bind(user.id)
-    .execute(&mut *tx)
-    .await
-    .map_err(db_err)?;
+    let app_id = insert_app_with_manifest(&mut tx, company_id, user.id, &manifest).await?;
     tx.commit().await.map_err(tx_err)?;
 
     audit(
@@ -227,18 +239,26 @@ async fn install(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
-    let target: Option<(Uuid,)> =
-        sqlx::query_as("SELECT id FROM app_versions WHERE app_id = $1 AND version = $2")
+    // Transitions take the exclusive lock so no record write can interleave
+    // and land against a manifest that is about to be replaced.
+    lock_app_for_transition(&mut tx, company_id, app_id).await?;
+    let target: Option<(Uuid, serde_json::Value)> =
+        sqlx::query_as("SELECT id, manifest FROM app_versions WHERE app_id = $1 AND version = $2")
             .bind(app_id)
             .bind(input.version)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?;
-    let (target_id,) = target.ok_or_else(|| {
+    let (target_id, target_manifest) = target.ok_or_else(|| {
         error_response(&Error::NotFound {
             entity: "app version".into(),
         })
     })?;
+    let target_manifest: AppManifest = serde_json::from_value(target_manifest)
+        .map_err(|_| error_response(&Error::Internal("stored manifest is invalid".into())))?;
+    // Refuse a switch that would strand data: every retained record must
+    // still fit the target schema. Nothing is migrated or dropped silently.
+    validate_retained_records(&mut tx, company_id, app_id, &target_manifest).await?;
     let current: Option<(Uuid, i32, String)> = sqlx::query_as(
         "SELECT i.id, v.version, i.status FROM app_installs i\n         JOIN app_versions v ON v.id = i.version_id\n         WHERE i.company_id = $1 AND i.app_id = $2",
     )
@@ -331,6 +351,7 @@ async fn uninstall(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
+    lock_app_for_transition(&mut tx, company_id, app_id).await?;
     let current: Option<(Uuid, i32, String)> = sqlx::query_as(
         "SELECT i.id, v.version, i.status FROM app_installs i\n         JOIN app_versions v ON v.id = i.version_id\n         WHERE i.company_id = $1 AND i.app_id = $2",
     )
@@ -472,6 +493,124 @@ fn entity_or_404<'a>(
     })
 }
 
+/// Entity role floor on top of the company-wide permission grant. Entity
+/// rules only ever narrow: a role below the floor is refused even though the
+/// permission check passed.
+fn require_role(
+    auth: &Authorization,
+    required: Role,
+    action: &str,
+    entity: &str,
+) -> Result<(), Response> {
+    if auth.role >= required {
+        return Ok(());
+    }
+    Err(error_response(&Error::Forbidden {
+        action: action.into(),
+        reason: format!(
+            "entity {} requires the {} role or higher",
+            entity,
+            required.as_str()
+        ),
+    }))
+}
+
+/// Lock key shared by record writers and install transitions.
+fn app_lock_key(company_id: Uuid, app_id: Uuid) -> String {
+    format!("businex:app:{}:{}", company_id, app_id)
+}
+
+/// Shared lock for record writes: writers run concurrently with each other
+/// but never while a version transition is committing, so every write
+/// validates against the manifest that is active when it lands.
+async fn lock_app_for_write(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    app_id: Uuid,
+) -> Result<(), Response> {
+    sqlx::query("SELECT pg_advisory_xact_lock_shared(hashtextextended($1, 0))")
+        .bind(app_lock_key(company_id, app_id))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Exclusive lock for install, upgrade, rollback and uninstall.
+async fn lock_app_for_transition(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    app_id: Uuid,
+) -> Result<(), Response> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(app_lock_key(company_id, app_id))
+        .execute(&mut **tx)
+        .await
+        .map_err(db_err)?;
+    Ok(())
+}
+
+/// Every retained record must still fit the target manifest before a version
+/// switch is allowed, including any uniqueness the target newly demands. An
+/// incompatible change is refused here and the data stays exactly where it
+/// is — nothing is migrated or dropped implicitly.
+async fn validate_retained_records(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    company_id: Uuid,
+    app_id: Uuid,
+    target: &AppManifest,
+) -> Result<(), Response> {
+    let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
+        "SELECT entity, data FROM app_records
+         WHERE company_id = $1 AND app_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(company_id)
+    .bind(app_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(db_err)?;
+    for (entity_name, data) in rows {
+        let fits = target
+            .entity(&entity_name)
+            .map(|schema| validate_record(schema, &data).is_ok())
+            .unwrap_or(false);
+        if !fits {
+            return Err(error_response(&Error::Conflict {
+                message: format!(
+                    "retained {} records do not fit the target version",
+                    entity_name
+                ),
+            }));
+        }
+    }
+    for schema in &target.entities {
+        for field in schema.fields.iter().filter(|f| f.unique) {
+            let dupes: Vec<(String,)> = sqlx::query_as(
+                "SELECT data->>$3 FROM app_records
+                 WHERE company_id = $1 AND app_id = $2 AND entity = $4
+                   AND deleted_at IS NULL AND data->>$3 IS NOT NULL
+                 GROUP BY data->>$3 HAVING count(*) > 1",
+            )
+            .bind(company_id)
+            .bind(app_id)
+            .bind(field.name.as_str())
+            .bind(schema.name.as_str())
+            .fetch_all(&mut **tx)
+            .await
+            .map_err(db_err)?;
+            if !dupes.is_empty() {
+                return Err(error_response(&Error::Conflict {
+                    message: format!(
+                        "retained {} records violate the {} uniqueness rule",
+                        schema.name, field.name
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Enforce manifest uniqueness declarations before writing a record.
 async fn ensure_unique(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -488,6 +627,18 @@ async fn ensure_unique(
             Some(other) if !other.is_null() => other.to_string(),
             _ => continue,
         };
+        // Serialize check-and-write on this exact value: two concurrent
+        // writers queue on the same transaction-scoped lock, so the loser's
+        // SELECT sees the winner's committed row instead of both accepting
+        // the same unique value.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!(
+                "businex:unique:{}:{}:{}:{}:{}",
+                company_id, app_id, entity, field.name, value
+            ))
+            .execute(&mut **tx)
+            .await
+            .map_err(db_err)?;
         let clash: Option<(Uuid,)> = sqlx::query_as(
             "SELECT id FROM app_records\n             WHERE company_id = $1 AND app_id = $2 AND entity = $3\n               AND deleted_at IS NULL AND data->>$4 = $5 AND id <> $6",
         )
@@ -515,13 +666,14 @@ async fn list_records(
     Path((company_id, app_id, entity)): Path<(Uuid, Uuid, String)>,
 ) -> Result<Response, Response> {
     let user = current_user(&state, &headers).await?;
-    authorize(&state, &user, company_id, Permission::RecordsRead, "*").await?;
+    let auth = authorize(&state, &user, company_id, Permission::RecordsRead, "*").await?;
     let ctx = businex_db::CompanyContext::new(company_id);
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
     let manifest = active_manifest(&mut tx, company_id, app_id).await?;
-    entity_or_404(&manifest, &entity)?;
+    let schema = entity_or_404(&manifest, &entity)?;
+    require_role(&auth, schema.access.read, "records.read", &entity)?;
     let rows: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT id, data FROM app_records\n         WHERE company_id = $1 AND app_id = $2 AND entity = $3 AND deleted_at IS NULL\n         ORDER BY created_at",
     )
@@ -555,8 +707,10 @@ async fn create_record(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
+    lock_app_for_write(&mut tx, company_id, app_id).await?;
     let manifest = active_manifest(&mut tx, company_id, app_id).await?;
     let schema = entity_or_404(&manifest, &entity)?;
+    require_role(&auth, schema.access.write, "records.write", &entity)?;
     validate_record(schema, &input.data).map_err(|e| error_response(&e))?;
     ensure_unique(
         &mut tx,
@@ -601,13 +755,14 @@ async fn get_record(
     Path((company_id, app_id, entity, record_id)): Path<(Uuid, Uuid, String, Uuid)>,
 ) -> Result<Response, Response> {
     let user = current_user(&state, &headers).await?;
-    authorize(&state, &user, company_id, Permission::RecordsRead, "*").await?;
+    let auth = authorize(&state, &user, company_id, Permission::RecordsRead, "*").await?;
     let ctx = businex_db::CompanyContext::new(company_id);
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
     let manifest = active_manifest(&mut tx, company_id, app_id).await?;
-    entity_or_404(&manifest, &entity)?;
+    let schema = entity_or_404(&manifest, &entity)?;
+    require_role(&auth, schema.access.read, "records.read", &entity)?;
     let row: Option<(Uuid, serde_json::Value)> = sqlx::query_as(
         "SELECT id, data FROM app_records\n         WHERE company_id = $1 AND app_id = $2 AND entity = $3 AND id = $4 AND deleted_at IS NULL",
     )
@@ -639,8 +794,10 @@ async fn update_record(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
+    lock_app_for_write(&mut tx, company_id, app_id).await?;
     let manifest = active_manifest(&mut tx, company_id, app_id).await?;
     let schema = entity_or_404(&manifest, &entity)?;
+    require_role(&auth, schema.access.write, "records.write", &entity)?;
     validate_record(schema, &input.data).map_err(|e| error_response(&e))?;
     ensure_unique(
         &mut tx,
@@ -694,6 +851,12 @@ async fn delete_record(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
+    lock_app_for_write(&mut tx, company_id, app_id).await?;
+    // Deleting goes through the same installed-app and entity checks as the
+    // other record paths: an uninstalled app's records stay untouched.
+    let manifest = active_manifest(&mut tx, company_id, app_id).await?;
+    let schema = entity_or_404(&manifest, &entity)?;
+    require_role(&auth, schema.access.delete, "records.delete", &entity)?;
     let updated = sqlx::query(
         "UPDATE app_records SET deleted_at = now()\n         WHERE company_id = $1 AND app_id = $2 AND entity = $3 AND id = $4 AND deleted_at IS NULL",
     )
