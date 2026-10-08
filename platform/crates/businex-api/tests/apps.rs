@@ -485,6 +485,140 @@ async fn generation_requires_admin_rights() {
     );
 }
 
+// Deletion denial spans both layers: roles without RecordsDelete (viewer,
+// member) are refused even though the record is readable and the app is
+// installed, and the entity floor is applied on top of the permission gate.
+#[tokio::test]
+async fn viewer_and_member_cannot_delete_records() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+    let (status, body) = owner
+        .post(&records, json!({"data": {"sku": "DEL-1", "qty": 1}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let record_id = body["id"].as_str().expect("record id").to_string();
+    let record_uri = format!("{}/{}", records, record_id);
+
+    for role in ["viewer", "member"] {
+        let (mut user, addr) = register(router(state.clone()), role).await;
+        let (status, invite) = owner
+            .post(
+                &format!("/api/companies/{}/invitations", company),
+                json!({"email": addr, "role": role}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", invite);
+        let token = invite
+            .get("token")
+            .and_then(|v| v.as_str())
+            .expect("token")
+            .to_string();
+        let (status, _) = user
+            .post("/api/invitations/accept", json!({"token": token}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // Readable, but deletion is denied.
+        let (status, _) = user.get(&record_uri).await;
+        assert_eq!(status, StatusCode::OK, "{} can read", role);
+        let (status, body) = user.delete(&record_uri).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{} delete: {}", role, body);
+    }
+
+    // Manager holds RecordsDelete and the entity floor is manager: deletes.
+    let (mut manager, addr) = register(router(state.clone()), "manager").await;
+    let (status, invite) = owner
+        .post(
+            &format!("/api/companies/{}/invitations", company),
+            json!({"email": addr, "role": "manager"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", invite);
+    let token = invite
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("token")
+        .to_string();
+    let (status, _) = manager
+        .post("/api/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = manager.delete(&record_uri).await;
+    assert_eq!(status, StatusCode::OK, "manager delete: {}", body);
+}
+
+// A create and an update racing onto one unique value admit exactly one
+// winner: the per-value lock serializes across both write paths, so the
+// mixed race cannot slip a duplicate through either one.
+#[tokio::test]
+async fn create_and_update_racing_on_one_value_admit_exactly_one() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+    let (status, body) = owner
+        .post(&records, json!({"data": {"sku": "OLD", "qty": 1}}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let existing_id = body["id"].as_str().expect("record id").to_string();
+    let existing_uri = format!("{}/{}", records, existing_id);
+
+    let mut creator = Client::new(owner.app.clone());
+    creator.cookie = owner.cookie.clone();
+    let mut updater = Client::new(owner.app.clone());
+    updater.cookie = owner.cookie.clone();
+    let (a, b) = tokio::join!(
+        creator.post(&records, json!({"data": {"sku": "TAKEN", "qty": 1}})),
+        updater.patch(&existing_uri, json!({"data": {"sku": "TAKEN", "qty": 2}}))
+    );
+    let statuses = [a.0, b.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one write path wins: {:?}",
+        statuses
+    );
+    assert!(
+        statuses.contains(&StatusCode::CONFLICT),
+        "the loser gets a conflict: {:?}",
+        statuses
+    );
+
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::OK);
+    let carriers = body["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .filter(|r| r["data"]["sku"] == "TAKEN")
+        .count();
+    assert_eq!(carriers, 1, "exactly one record carries the value");
+}
+
 // Two concurrent updates racing onto the same unique value admit exactly
 // one: the per-value lock in ensure_unique serializes the update path's
 // check-and-write just like the create path.
