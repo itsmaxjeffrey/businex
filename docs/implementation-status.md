@@ -11,13 +11,14 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-29). Backend tally: 145 passing, 0 failed
-(cargo test --workspace, run 27, log /tmp/businex-workspace-run27.log,
-28 result targets). Web tally (run 28): 25 Vitest passing, 0 failed
-(ui library 15 + desktop 10); tsc typecheck green; vite build green.
-E2E (run 29): Playwright smoke 1/1 green (register, company create,
-invite, sign out, sign in) against a disposable DB + local API + the
-production bundle; document-load numbers recorded below.
+Last updated: 2026-10-08 (runs 1-31). Backend tally: 148 passing, 0 failed
+(businex-api 53 green in run 31 after the key-refresh narrowing; the other
+crates are unchanged since the 145-green run-27 workspace sweep,
+log /tmp/businex-workspace-run27.log). Web tally (run 28): 25 Vitest
+passing, 0 failed (ui library 15 + desktop 10); tsc typecheck green; vite
+build green. E2E (run 29): Playwright smoke 1/1 green (register, company
+create, invite, sign out, sign in) against a disposable DB + local API +
+the production bundle; document-load numbers recorded below.
 api 50 (unit 14, routes 5, identity 14, oidc 15, rate limit 2), core 13,
 rls 4, events 7 (unit 2 + relay 5), queue 17 (unit 6 + queue 10 +
 tenant 1), worker 9, models 45 (types/pricing 27 unit, adapter contracts 11,
@@ -123,7 +124,7 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 | V3 | Two-issuer test must use distinct verified e-mails; add a same-email cross-issuer assertion that conflicts without linking | tested | same_subject_under_two_issuers_never_shares_an_account now sets user-a@example.test / user-b@example.test. New same_email_across_issuers_conflicts_without_linking: second issuer asserting the same verified e-mail gets 409 Conflict, no session, zero oidc_identities rows for that issuer, exactly one user row |
 | V4 | Test cookie helper must keep all Set-Cookie values in a name-keyed jar (no get-first + overwrite) | tested | Client now stores HashMap<cookie-name, value>, ingests every Set-Cookie via headers().get_all, and sends the whole jar; set_cookie merges by name instead of replacing. Session and binding cookies coexist across valid_login and stolen-flow tests |
 | V5 | Exact-issuer trailing-slash normalization collision coverage | tested | Fixed in continuing work per PM checkpoint. issuer_key() returns the exact configured string (OIDC Core simple string comparison; a trailing slash marks a different issuer and is never normalized away), so "https://idp.example" and "https://idp.example/" are distinct identity keys. Unit test issuer_key_slash_variants_do_not_collide green (run-26/27); identity rows bind the exact issuer string |
-| V6 | Provider key refresh (JWKS rotation) | tested | Fixed in continuing work per PM checkpoint. The discovery cache is bounded by PROVIDER_CACHE_TTL (600s); the reqwest client uses 5s connect / 10s total timeouts and refuses redirects; when ID-token verification fails against cached JWKS the cache is dropped and discovery runs exactly once more with full re-verification. rotated_jwks_is_refreshed_without_stale_cache proves a rotated signing key is absorbed with the discovery counter at exactly 2 (run-26/27) |
+| V6 | Provider key refresh (JWKS rotation) | tested | The discovery cache is bounded by PROVIDER_CACHE_TTL (600s); the reqwest client uses 5s connect / 10s total timeouts and refuses redirects. Refresh is narrow: ONLY a signing-key failure (ClaimsVerificationError::SignatureVerification) may trigger re-discovery — wrong nonce, audience, issuer or expiry fail directly with zero provider traffic. Concurrent failures coalesce behind a single-flight gate (exactly one fetch; peers re-verify against the cache it filled) and a REFRESH_COOLDOWN (15s) bounds repeats even for a flood of bad signatures. Proofs (run-30/31, oidc 18/18): rotated_jwks_is_refreshed_without_stale_cache (rotation absorbed, discovery counter exactly 2), wrong_signature_is_rejected + wrong_signature_denial_is_bounded_to_one_refresh (denial holds and repeat failures never refetch inside the cooldown), concurrent_signature_failures_share_a_single_refresh (two parallel failures cost one refresh), claim_failures_never_trigger_a_provider_refresh (nonce/audience/expiry cost zero extra discoveries) |
 
 ## PM checkpoint review follow-ups (2026-10-08)
 
@@ -133,6 +134,8 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 | C2 | Bounded provider/JWKS cache with refresh and HTTP timeouts | tested | PROVIDER_CACHE_TTL 600s; 5s connect / 10s total reqwest timeouts; redirect policy none; one-shot re-discovery retry on verification failure; rotated_jwks_is_refreshed_without_stale_cache (run-26/27) |
 | C3 | Same-email cross-issuer conflict regression | verified | The checkpoint claim that this regression is absent is stale: same_email_across_issuers_conflicts_without_linking has existed since ec46179 and is green in run-26 and run-27 (409, no session, zero second-issuer identity rows, exactly one user row) |
 | C4 | Startup URL validation | tested | valid_url accepts only http/https URLs with a host and no userinfo/fragment (issuer additionally no query); OidcConfigError::InvalidIssuer / InvalidRedirectUrl fail startup; 4 unit tests (run-26/27) |
+| C6 | Refresh provider keys only for signing-key failures; wrong nonce/audience/expiry fail directly | tested | claim_failures_never_trigger_a_provider_refresh asserts the discovery counter stays at 1 across wrong nonce, wrong audience and expired tokens (run-30/31) |
+| C7 | Coalesce concurrent refreshes and enforce a small cooldown | tested | Single-flight refresh gate plus REFRESH_COOLDOWN (15s): concurrent_signature_failures_share_a_single_refresh (one shared refresh for two parallel failures) and wrong_signature_denial_is_bounded_to_one_refresh (a second failure inside the window does not refetch) — run-30/31 |
 | C5 | Identify the broad cargo fmt diff honestly; preserve behavior | documented | The cargo fmt normalization landed inside f1fa950 (37 files: 32 modified + 5 added). rustfmt round-trip on each pre-change file proves 8 of the 32 modified files are formatting-only: businex-core/src/lib.rs, businex-models/src/{budget,keys,lib,pricing,types,urlpolicy}.rs, businex-queue/src/cron.rs. The other 24 modified files mix formatting with behavior changes from the same commit. Behavior preserved: workspace suite green before (run-22: 139/0) and after (run-27: 145/0) |
 
 ## Known gates and limitations

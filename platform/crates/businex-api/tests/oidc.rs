@@ -702,6 +702,117 @@ async fn rotated_jwks_is_refreshed_without_stale_cache() {
 }
 
 #[tokio::test]
+async fn claim_failures_never_trigger_a_provider_refresh() {
+    let db = TestDb::new().await;
+    let (issuer, spec) = mock_provider();
+    let app = app_for(&db, &issuer).await;
+    let mut client = Client::new(app);
+
+    // Wrong nonce: a definitive rejection.
+    let (state, _nonce, _challenge) = start_flow(&mut client).await;
+    spec.lock().unwrap().nonce = "tampered".to_string();
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Wrong audience: a definitive rejection.
+    let (state, nonce, _challenge) = start_flow(&mut client).await;
+    {
+        let mut s = spec.lock().unwrap();
+        s.nonce = nonce;
+        s.aud_override = Some("other-client".to_string());
+    }
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Expired token: a definitive rejection.
+    let (state, nonce, _challenge) = start_flow(&mut client).await;
+    {
+        let mut s = spec.lock().unwrap();
+        s.nonce = nonce;
+        s.exp_offset_secs = -3600;
+    }
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Claim failures are definitive: apart from the discovery made by the
+    // first /start, none of them may cost provider traffic.
+    assert_eq!(
+        spec.lock().unwrap().discoveries,
+        1,
+        "wrong nonce/audience/expiry must never re-discover the provider"
+    );
+}
+
+#[tokio::test]
+async fn wrong_signature_denial_is_bounded_to_one_refresh() {
+    let db = TestDb::new().await;
+    let (issuer, spec) = mock_provider();
+    let app = app_for(&db, &issuer).await;
+    let mut client = Client::new(app);
+    // Tokens are signed with a key the provider never publishes, so every
+    // signature check fails — the rotated-key hypothesis gets one refresh
+    // and nothing more.
+    spec.lock().unwrap().wrong_key = true;
+
+    let (state, _nonce, _challenge) = start_flow(&mut client).await;
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        spec.lock().unwrap().discoveries,
+        2,
+        "first signature failure gets exactly one refresh attempt"
+    );
+
+    let (state, _nonce, _challenge) = start_flow(&mut client).await;
+    let (status, _body, _sc) = client
+        .call(&format!("/api/auth/oidc/callback?code=***&state={}", state))
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        spec.lock().unwrap().discoveries,
+        2,
+        "a second signature failure inside the cooldown must not refresh again"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_signature_failures_share_a_single_refresh() {
+    let db = TestDb::new().await;
+    let (issuer, spec) = mock_provider();
+    let app = app_for(&db, &issuer).await;
+    let mut browser_a = Client::new(app.clone());
+    let mut browser_b = Client::new(app.clone());
+    let (state_a, _nonce_a, _challenge_a) = start_flow(&mut browser_a).await;
+    let (state_b, _nonce_b, _challenge_b) = start_flow(&mut browser_b).await;
+    spec.lock().unwrap().wrong_key = true;
+
+    // Bind the URLs first: the join! futures borrow them, so they must
+    // outlive the macro call.
+    let url_a = format!("/api/auth/oidc/callback?code=***&state={}", state_a);
+    let url_b = format!("/api/auth/oidc/callback?code=***&state={}", state_b);
+    let call_a = browser_a.call(&url_a);
+    let call_b = browser_b.call(&url_b);
+    let ((status_a, ..), (status_b, ..)) = tokio::join!(call_a, call_b);
+    assert_eq!(status_a, StatusCode::FORBIDDEN);
+    assert_eq!(status_b, StatusCode::FORBIDDEN);
+    // One discovery from the first /start plus exactly one shared refresh:
+    // concurrent failures coalesce instead of stampeding discovery.
+    assert_eq!(
+        spec.lock().unwrap().discoveries,
+        2,
+        "concurrent signature failures must share a single refresh"
+    );
+}
+
+#[tokio::test]
 async fn unconfigured_oidc_routes_fail_safely() {
     let db = TestDb::new().await;
     let state = AppState::with_memory_limiter(

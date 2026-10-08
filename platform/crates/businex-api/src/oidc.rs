@@ -37,9 +37,9 @@ use uuid::Uuid;
 use openidconnect::core::{CoreClient, CoreIdTokenClaims, CoreProviderMetadata, CoreResponseType};
 use openidconnect::reqwest;
 use openidconnect::{
-    AuthenticationFlow, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
-    EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier,
-    RedirectUrl, Scope, TokenResponse,
+    AuthenticationFlow, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret,
+    CsrfToken, EndpointMaybeSet, EndpointNotSet, EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
 
 /// Client produced by discovery: authorization endpoint is always known,
@@ -233,6 +233,12 @@ pub struct OidcRuntime {
     pub config: OidcConfig,
     pub http: reqwest::Client,
     provider: Arc<tokio::sync::RwLock<Option<CachedProvider>>>,
+    /// Single-flight gate for failure-triggered key refreshes. Held for the
+    /// whole refresh (stamp check through fetch), so concurrent verification
+    /// failures coalesce onto one discovery and the second caller simply
+    /// re-verifies against the cache the first one just filled. Doubles as
+    /// the cooldown stamp.
+    refresh: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
 }
 
 /// Cached discovery metadata with an expiry: exactly one entry, replaced in
@@ -246,6 +252,13 @@ struct CachedProvider {
 /// Discovery cache lifetime. Bounded on purpose: provider metadata and JWKS
 /// go stale, so a forever-cache pins rotated signing keys.
 const PROVIDER_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Minimum spacing between failure-triggered key refreshes. A signature
+/// failure may mean provider key rotation, but a flood of bad tokens must
+/// never become a flood of discovery requests: at most one refresh runs per
+/// window (and concurrent failures share that one), while wrong nonce,
+/// audience, issuer or expiry never reach the refresh path at all.
+const REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl std::fmt::Debug for OidcRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -270,6 +283,7 @@ impl OidcRuntime {
             config,
             http,
             provider: Arc::new(tokio::sync::RwLock::new(None)),
+            refresh: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -309,11 +323,38 @@ impl OidcRuntime {
         Ok(shared)
     }
 
-    /// Drop the cache so the next lookup re-discovers. Used at most once per
-    /// callback when signature verification fails — that is how signing-key
-    /// rotation is absorbed without a process restart.
+    /// Drop the cache so the next lookup re-discovers.
     async fn invalidate_provider(&self) {
         *self.provider.write().await = None;
+    }
+
+    /// Absorb a provider signing-key rotation without stampeding discovery.
+    ///
+    /// Only a signing-key verification failure may call this. Callers
+    /// coalesce on the refresh gate: one refresh runs per REFRESH_COOLDOWN
+    /// window no matter how many signatures fail at once, and every caller
+    /// leaves with the freshest cached metadata to re-verify against. The
+    /// stamp is taken before the fetch so even a failed fetch is covered by
+    /// the cooldown — a down provider is not hammered either.
+    async fn refresh_provider(&self) -> Result<Arc<CoreProviderMetadata>, Response> {
+        let mut gate = self.refresh.lock().await;
+        if let Some(attempted) = *gate {
+            if attempted.elapsed() < REFRESH_COOLDOWN {
+                // Inside the cooldown window: this caller either waited for a
+                // peer's refresh or arrived right after one. Re-verify against
+                // the cache as-is; never fetch again here.
+                let cached = self.provider.read().await;
+                return match cached.as_ref() {
+                    Some(entry) => Ok(entry.metadata.clone()),
+                    None => Err(error_response(&Error::Internal(
+                        "oidc discovery failed".into(),
+                    ))),
+                };
+            }
+        }
+        *gate = Some(std::time::Instant::now());
+        self.invalidate_provider().await;
+        self.fetch_provider().await
     }
 
     /// Build the OIDC client from discovered metadata.
@@ -608,22 +649,27 @@ async fn callback(
     })?;
 
     // Library verification: signature, issuer, audience, expiry and nonce.
-    // Providers may rotate signing keys; when verification fails against the
-    // cached JWKS we drop the cache, re-discover once, and verify again. The
-    // retry relaxes nothing — the token must pass the same full verification.
+    // Signing-key rotation is absorbed by a single, cooldown-bounded refresh
+    // — but only when the failure IS the signature check. A wrong nonce,
+    // audience, issuer or expiry is a definitive rejection: it fails directly
+    // and never costs provider traffic. The retry relaxes nothing — the token
+    // must pass the same full verification.
     let nonce = Nonce::new(stored_nonce);
-    // Snapshot the claims as owned values inside the statement so swapping
-    // clients on the retry path cannot create borrow-of-temporary errors.
+    // Snapshot the claims as owned values so swapping clients on the retry
+    // path cannot create borrow-of-temporary errors.
     let mut verified = idt
         .claims(&client.id_token_verifier(), &nonce)
         .map(VerifiedClaims::from);
-    if verified.is_err() {
+    let signature_failure = matches!(
+        verified,
+        Err(ClaimsVerificationError::SignatureVerification(_))
+    );
+    if signature_failure {
         tracing::warn!(
             stage = "verify",
-            "oidc verification failed; re-discovering provider once"
+            "oidc signature check failed; refreshing provider keys once"
         );
-        oidc.invalidate_provider().await;
-        let provider = oidc.fetch_provider().await?;
+        let provider = oidc.refresh_provider().await?;
         let client = oidc.client(&provider)?;
         verified = idt
             .claims(&client.id_token_verifier(), &nonce)
