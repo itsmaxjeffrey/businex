@@ -13,9 +13,13 @@
     "dev": "npm run dev -w @businex/desktop",
     "build": "npm run build -w @businex/desktop",
     "test": "npm run test -w @businex/ui && npm run test -w @businex/desktop",
-    "typecheck": "npm run typecheck -w @businex/ui && npm run typecheck -w @businex/desktop"
+    "typecheck": "npm run typecheck -w @businex/ui && npm run typecheck -w @businex/desktop",
+    "test:e2e": "playwright test"
   },
   "engines": {
     "node": ">=22"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.64.0"
   }
 }
