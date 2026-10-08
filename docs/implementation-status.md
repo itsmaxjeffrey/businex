@@ -11,9 +11,10 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-27). Test tally: 145 passing, 0 failed
+Last updated: 2026-10-08 (runs 1-28). Backend tally: 145 passing, 0 failed
 (cargo test --workspace, run 27, log /tmp/businex-workspace-run27.log,
-28 result targets):
+28 result targets). Web tally (run 28): 25 Vitest passing, 0 failed
+(ui library 15 + desktop 10); tsc typecheck green; vite build green.
 api 50 (unit 14, routes 5, identity 14, oidc 15, rate limit 2), core 13,
 rls 4, events 7 (unit 2 + relay 5), queue 17 (unit 6 + queue 10 +
 tenant 1), worker 9, models 45 (types/pricing 27 unit, adapter contracts 11,
@@ -38,7 +39,7 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 
 | ID | Requirement | Status | Evidence |
 | --- | --- | --- | --- |
-| T1 | SolidJS + TypeScript + Vite web interface, reusable UI library, generated app frontend | incomplete | Phase 3 begins after this checkpoint: all five UI skills read in full first, then the business desktop and auth/team flows |
+| T1 | SolidJS + TypeScript + Vite web interface, reusable UI library, generated app frontend | incomplete | Phase 3 UI slice landed in platform/web (run 28): @businex/ui library (12 components plus tokens.css/styles.css derived from DESIGN.md, 15 Vitest tests) and @businex/desktop business app (typed API client for the Rust API, hash router with deep links, session state, Login/Register/Home/Team/Settings pages covering sign-in, company creation, member role management, invitations, sign-out; 10 Vitest tests). tsc typecheck green for both packages; vite production build green (739ms; app JS 41.97 kB / 13.91 kB gzip, CSS 24.02 kB / 7.67 kB gzip; dist 949672 B dominated by bundled font subsets). Generated-app frontend remains with the app builder |
 | T2 | Tauri 2 desktop shell macOS/Windows/Linux, scoped native bridges, signed updater setup | incomplete | |
 | T3 | Responsive browser access for mobile plus real Android/iOS scaffolding with documented build requirements; no unbuilt native platform claimed tested | incomplete | |
 | T4 | Rust + Axum + Tokio + Tower platform API and Rust durable workers, SQLx queries/migrations | incomplete | Six-crate workspace (core/db/queue/events/api/worker) builds with Rust 1.99; businex-worker executes jobs with lease heartbeat. businex-api now serves health/readiness, session identity (register/login/me/logout), companies/memberships/invitations/grants with rate limits, and OIDC login routes (see T8/T9). Business domain routes (CRM/projects/invoices/documents), OpenAPI contract and full worker handler set remain (Phases 4-6) |
@@ -55,7 +56,7 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 | T15 | Per-company model keys stored protected, streaming, model selection, budgets, token/cost tracking with explicit unknown prices | implemented | Keys sealed AES-256-GCM with random nonces and tenant+provider authenticated binding (moved ciphertext fails open; debug redacts material). Streaming via robust SSE parser. Pricing carries provider/model/currency/effective date/estimate flag; cost uses checked arithmetic; absent usage stays Option::None and yields unknown cost. Durable budgets in PostgreSQL (migration 0006) with atomic reserve/settle/release under a row lock: concurrent reservations cannot double-spend, settled reservations cannot replay, totals survive restart (store tests, 7). Model selection wiring into the builder lands with Phase 5 |
 | T16 | PostgreSQL durable queue: leases, cancellation, schedules, bounded retries, idempotency, uncertain external-outcome handling | tested | businex-queue + businex-worker, 17 tests: claim/complete roundtrip with fencing token; duplicate enqueue prevented by idempotency key; worker-death lease expiry reclaim and exactly-once crash recovery (crash simulated in-process via claim-without-complete plus lease expiry; an actual OS worker process kill/restart is not yet directly evidenced); stale attempt fenced even with same worker id (expired lease cannot complete, fail or heartbeat); bounded retries recorded; cancellation truthful for queued and leased jobs; tenant-scoped cancellation denied across companies (RLS); schedules fire exactly once (interval + cron) with replay-proof idempotency keys; external effects recorded pending before the call and never auto-replayed (blind retry refused, reconciler path tested) |
 | T17 | OpenTelemetry, structured redacted logs, health/readiness, latency/job/model usage metrics | incomplete | Structured JSON logs via tracing-subscriber with documented redaction policy (never log secrets, tokens, provider errors, headers); /healthz liveness, /readyz dependency readiness, /api/health summary with request-id propagation and trace layer. OpenTelemetry metrics and latency/job/model usage metrics remain |
-| T18 | Cargo tests, Vitest, Playwright, container CI/CD, Docker Compose self-hosting, managed-cloud deployment templates and provisioning scripts with explicit secrets and backups; no unsupported one-click claims | incomplete | |
+| T18 | Cargo tests, Vitest, Playwright, container CI/CD, Docker Compose self-hosting, managed-cloud deployment templates and provisioning scripts with explicit secrets and backups; no unsupported one-click claims | incomplete | Cargo workspace 145/145 green (run 27) and Vitest 25/25 green (run 28) recorded. Playwright e2e, container CI/CD, Compose self-hosting, cloud templates and provisioning remain |
 
 ## Product workflows
 
@@ -95,7 +96,7 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 | R5 | Queue tests: real worker restart, expiring leases, stale-completion fencing, scoped cancellation, duplicate enqueue/external action handling | partial | businex-queue/tests/queue.rs + tenant_scoped.rs + businex-worker/tests/worker.rs (17 tests) cover expiring leases, stale-completion fencing with identical worker id, scoped cancellation, and duplicate enqueue/external-action handling. Crash recovery is simulated in-process (claim-without-complete + lease expiry); a real OS worker process kill/restart probe remains outstanding |
 | R6 | Status tracker accuracy: reviewed is distinct from implemented | implemented | This file rewritten with per-row evidence; test tally recorded above |
 | R7 | Mac build host available (Xcode 26.6 via DEVELOPER_DIR), WebKit/Windows remain gates | implemented | Recorded in Known gates below; desktop build targets tracked honestly |
-| R8 | Read and apply all five UI skills before UI work | incomplete | Skills staged in workspace/skills (excluded from commits via .git/info/exclude). Full read of all five SKILL.md files is the first Phase 3 action in this run, immediately after this checkpoint; application evidence lands with the first UI commit |
+| R8 | Read and apply all five UI skills before UI work | verified | All five SKILL.md files (design-taste, frontend-design, frontend-ui-ux, impeccable, ui-ux-pro-max) read in full before any UI code; platform/web/DESIGN.md records the application: product/variance/motion/density dials, tokens, layout, principles, rejected defaults, plus the component-taste and WCAG 2.2 AA passes. The green 25-test UI suite and build are the application evidence (run 28) |
 
 ## PM review 2 follow-ups (2026-10-07)
 

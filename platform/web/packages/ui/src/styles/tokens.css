@@ -1,0 +1,74 @@
+/* Businex design tokens. One source of truth for color, type, space, radius, motion.
+   Values and rationale: platform/web/DESIGN.md. No raw values belong in component CSS. */
+
+:root {
+  /* Color */
+  --bx-canvas: #f7f9fc;
+  --bx-surface: #ffffff;
+  --bx-surface-2: #eef2f8;
+  --bx-ink: #16233b;
+  --bx-ink-2: #5a6b87;
+  --bx-line: #dce3ee;
+  --bx-line-strong: #c3cddf;
+  --bx-brand: #1e40af;
+  --bx-brand-strong: #1b3797;
+  --bx-brand-soft: #e8eefc;
+  --bx-on-brand: #ffffff;
+  --bx-accent: #b45309;
+  --bx-on-accent: #ffffff;
+  --bx-accent-soft: #fdf0dd;
+  --bx-success: #15803d;
+  --bx-success-soft: #e5f5ea;
+  --bx-danger: #b91c1c;
+  --bx-danger-strong: #991b1b;
+  --bx-danger-soft: #fbe9e9;
+  --bx-rail: #101c30;
+  --bx-rail-ink: #c6d2e4;
+  --bx-rail-line: #24344f;
+
+  /* Type */
+  --bx-font-ui: "Fira Sans", "Segoe UI", system-ui, sans-serif;
+  --bx-font-code: "Fira Code", ui-monospace, "SF Mono", Menlo, monospace;
+  --bx-text-xs: 0.75rem;
+  --bx-text-sm: 0.875rem;
+  --bx-text-md: 1rem;
+  --bx-text-lg: 1.25rem;
+  --bx-text-xl: 1.5rem;
+  --bx-text-2xl: 2rem;
+  --bx-leading-body: 1.5;
+  --bx-leading-tight: 1.25;
+
+  /* Space (4px grid) */
+  --bx-space-1: 4px;
+  --bx-space-2: 8px;
+  --bx-space-3: 12px;
+  --bx-space-4: 16px;
+  --bx-space-5: 24px;
+  --bx-space-6: 32px;
+  --bx-space-7: 48px;
+
+  /* Radius: nested elements use a smaller radius than their container */
+  --bx-radius-sm: 6px;
+  --bx-radius-md: 10px;
+  --bx-radius-inner: 4px;
+  --bx-radius-pill: 999px;
+
+  /* Elevation: overlays only */
+  --bx-shadow-overlay: 0 2px 6px rgba(22, 35, 59, 0.08), 0 12px 32px rgba(22, 35, 59, 0.18);
+
+  /* Motion */
+  --bx-dur-fast: 120ms;
+  --bx-dur-base: 240ms;
+  --bx-ease: cubic-bezier(0.2, 0, 0, 1);
+
+  /* Focus */
+  --bx-focus-ring: 2px solid var(--bx-brand);
+  --bx-focus-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --bx-dur-fast: 0.01ms;
+    --bx-dur-base: 0.01ms;
+  }
+}

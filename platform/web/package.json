@@ -1,0 +1,21 @@
+{
+  "name": "businex-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Businex business desktop (SolidJS) and reusable UI library.",
+  "license": "Apache-2.0",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w @businex/desktop",
+    "build": "npm run build -w @businex/desktop",
+    "test": "npm run test -w @businex/ui && npm run test -w @businex/desktop",
+    "typecheck": "npm run typecheck -w @businex/ui && npm run typecheck -w @businex/desktop"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
