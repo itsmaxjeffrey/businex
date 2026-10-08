@@ -11,7 +11,9 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-44). Run 44 (consolidated checklist
+Last updated: 2026-10-08 (runs 1-45). Run 45 (app-lifecycle patch
+finish): models+api+core 148 passing, 0 failed, exit 0
+(log /tmp/businex-run45.log). Run 44 (consolidated checklist
 recheck + publish serialization): models+api+core 146 passing, 0 failed,
 exit 0 (log /tmp/businex-run44.log). Run 43 (PM budget review
 fixes): models+api+core 144 passing, 0 failed, exit 0
@@ -189,9 +191,9 @@ full brief.
 
 | Checklist item | Status | Evidence |
 | --- | --- | --- |
-| Concurrent creates/updates cannot duplicate a unique field; prove with simultaneous requests under the restricted application DB role | fixed | G1 lock + simultaneous_unique_writers_admit_exactly_one_record; the two racing requests run through begin_company_tx which pins SET LOCAL ROLE businex_app, so the proof is under the restricted role (run 40) |
+| Concurrent creates/updates cannot duplicate a unique field; prove with simultaneous requests under the restricted application DB role | fixed | G1 lock + simultaneous_unique_writers_admit_exactly_one_record (creates) and simultaneous_updates_cannot_duplicate_a_unique_value (updates racing onto the same barcode, exactly one wins). The restricted-role claim is now proven, not asserted: app_transactions_pin_the_restricted_application_role checks SELECT current_role inside begin_company_tx, the transaction path every record write takes (run 45) |
 | Serialize version publishing/install transitions; validate retained data before upgrade/rollback; failed compatibility preserves installed version and records atomically | fixed | Install/upgrade/rollback hold the exclusive per-app lock and validate retained records first (G2). Publishing was the gap: max(version)+1 was unlocked. publish_version now takes lock_app_for_transition before the version read. Proofs: concurrent_publishes_serialize_version_numbers (versions 2 and 3, no duplicate-version conflict) and version_switches_refuse_changes_that_invalidate_retained_records (refused switch leaves install and records untouched) (run 44) |
-| Record deletion after uninstall fails consistently with other CRUD | fixed | G3: deleting_records_requires_a_live_install (run 40) |
+| Record deletion after uninstall fails consistently with other CRUD | fixed | G3: deleting_records_requires_a_live_install, extended so GET/POST/PATCH all fail with the same conflict as DELETE while uninstalled - one consistent refusal across verbs (run 45) |
 | Warehouse/member vs manager enforced per entity/action, not merely company permissions | fixed | G4: entity_action_rules_narrow_writes_by_role (run 40) |
 | Generation callers cannot override destination for stored secrets; endpoint bound to admin key config; redirects/outbound validated; trusted local endpoints supported | fixed | G6: generation_cannot_redirect_a_key_to_an_unauthorized_endpoint; endpoint stored under ModelKeysManage, urlpolicy-validated (https or explicit loopback), adapter client never follows redirects (run 42) |
 | Malicious endpoint override tested without transmitting any real secret | fixed | Same proof: the refused request dispatches nothing (zero generator calls) and the key never leaves storage; test fixtures use dummy strings (run 42) |
@@ -219,7 +221,7 @@ full brief.
 
 Per-document-load numbers recorded inside the browser runs (run 39): desktop cold-register load 89ms / DCL 84ms / FCP 252ms, warm-home load 56ms / DCL 45ms / FCP 128ms; mobile cold-register load 88ms / DCL 83ms / FCP 204ms, warm-home load 38ms / DCL 37ms / FCP 92ms. These are synthetic local-lab document-load timings measured by the harness against vite preview on loopback — not real-user metrics such as LCP or INP, and never to be quoted as such.
 
-Run evidence: /tmp/businex-run44.log (models+api+core 146/0, exit 0), /tmp/businex-run43.log (models+api+core 144/0, exit 0), /tmp/businex-run42.log (api+core+models 139/0, exit 0), /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
+Run evidence: /tmp/businex-run45.log (models+api+core 148/0, exit 0), /tmp/businex-run44.log (models+api+core 146/0, exit 0), /tmp/businex-run43.log (models+api+core 144/0, exit 0), /tmp/businex-run42.log (api+core+models 139/0, exit 0), /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
 
 ## Known gates and limitations
 

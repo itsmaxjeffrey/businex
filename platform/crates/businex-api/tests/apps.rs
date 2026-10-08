@@ -485,6 +485,93 @@ async fn generation_requires_admin_rights() {
     );
 }
 
+// Two concurrent updates racing onto the same unique value admit exactly
+// one: the per-value lock in ensure_unique serializes the update path's
+// check-and-write just like the create path.
+#[tokio::test]
+async fn simultaneous_updates_cannot_duplicate_a_unique_value() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let (status, _) = owner
+        .post(
+            &format!("{}/{}/install", apps, app_id),
+            json!({"version": 1}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let records = format!("{}/{}/records/item", apps, app_id);
+
+    let mut ids = Vec::new();
+    for sku in ["A-1", "B-2"] {
+        let (status, body) = owner
+            .post(&records, json!({"data": {"sku": sku, "qty": 1}}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{}", body);
+        ids.push(body["id"].as_str().expect("record id").to_string());
+    }
+
+    let mut first = Client::new(owner.app.clone());
+    first.cookie = owner.cookie.clone();
+    let mut second = Client::new(owner.app.clone());
+    second.cookie = owner.cookie.clone();
+    let uri_a = format!("{}/{}", records, ids[0]);
+    let uri_b = format!("{}/{}", records, ids[1]);
+    let (a, b) = tokio::join!(
+        first.patch(&uri_a, json!({"data": {"sku": "RACE-9", "qty": 1}})),
+        second.patch(&uri_b, json!({"data": {"sku": "RACE-9", "qty": 2}}))
+    );
+    let statuses = [a.0, b.0];
+    assert_eq!(
+        statuses.iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one update wins: {:?}",
+        statuses
+    );
+    assert!(
+        statuses.contains(&StatusCode::CONFLICT),
+        "the loser gets a conflict: {:?}",
+        statuses
+    );
+
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::OK);
+    let carriers = body["records"]
+        .as_array()
+        .expect("records")
+        .iter()
+        .filter(|r| r["data"]["sku"] == "RACE-9")
+        .count();
+    assert_eq!(carriers, 1, "exactly one record carries the barcode");
+}
+
+// The concurrency proofs drive the real API handlers, which write inside
+// begin_company_tx. That helper pins the restricted application role; prove
+// the pin is what those transactions actually run under.
+#[tokio::test]
+async fn app_transactions_pin_the_restricted_application_role() {
+    let (db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let company_id = Uuid::parse_str(&company).expect("company uuid");
+    let ctx = businex_db::CompanyContext::with_actor(company_id, Uuid::nil());
+    let mut tx = businex_db::begin_company_tx(&db.pool, ctx)
+        .await
+        .expect("company tx");
+    let role: (String,) = sqlx::query_as("SELECT current_role")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("role");
+    assert_eq!(
+        role.0, "businex_app",
+        "record writes land under the restricted role"
+    );
+}
+
 // Two writers racing on the same unique value must produce exactly one
 // record: the transaction-scoped lock in ensure_unique serializes the
 // check-and-write so the loser sees the winner's row.
@@ -655,8 +742,22 @@ async fn deleting_records_requires_a_live_install() {
         .await;
     assert_eq!(status, StatusCode::OK, "{}", body);
 
-    // Delete is refused while uninstalled, and the record survives.
+    // Delete is refused while uninstalled, and every other verb fails the
+    // same way: one consistent "app is not installed" refusal.
     let (status, body) = owner.delete(&format!("{}/{}", records, record_id)).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+    let (status, body) = owner.get(&records).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+    let (status, body) = owner
+        .post(&records, json!({"data": {"sku": "B-2", "qty": 1}}))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{}", body);
+    let (status, body) = owner
+        .patch(
+            &format!("{}/{}", records, record_id),
+            json!({"data": {"qty": 9}}),
+        )
+        .await;
     assert_eq!(status, StatusCode::CONFLICT, "{}", body);
 
     let (status, _) = owner
