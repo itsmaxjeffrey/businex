@@ -88,6 +88,17 @@ test("team journey: invite, accept, role change, denial, removal", async ({ page
   await expect(teammate.getByText(/role viewer does not grant members.manage/)).toBeVisible();
   await expect(teammateRow.getByText("viewer", { exact: true })).toBeVisible();
 
+  // The same refusal protects the membership itself: the viewer cannot
+  // remove their own row, and it stays put. The first error toast is
+  // dismissed before the attempt so the second denial is a fresh signal.
+  await teammate.getByRole("button", { name: "Dismiss", exact: true }).click();
+  await teammateRow.getByRole("button", { name: "Remove", exact: true }).click();
+  const teammateRemove = teammate.getByRole("dialog", { name: "Remove member" });
+  await teammateRemove.getByRole("button", { name: "Remove", exact: true }).click();
+  await expect(teammate.getByText(/role viewer does not grant members.manage/)).toBeVisible();
+  await expect(teammateRow.getByText("viewer", { exact: true })).toBeVisible();
+  await teammate.keyboard.press("Escape");
+
   // Removal drops the member immediately: the row disappears and the
   // removed account is left with no company to manage.
   await memberRow.getByRole("button", { name: "Remove", exact: true }).click();

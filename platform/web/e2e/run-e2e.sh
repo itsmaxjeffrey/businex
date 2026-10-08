@@ -36,6 +36,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Build the current tree first: the harness must never silently exercise a
+# stale target/debug binary.
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --manifest-path "$REPO/platform/Cargo.toml" -p businex-api
+echo "e2e: api built from current sources"
+
 BUSINEX_HOST=127.0.0.1 BUSINEX_PORT=8790 \
 BUSINEX_DATABASE_URL="$APP_URL" \
 BUSINEX_DATABASE_ADMIN_URL="$ADMIN_URL" \
