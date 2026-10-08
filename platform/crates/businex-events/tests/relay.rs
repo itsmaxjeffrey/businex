@@ -29,7 +29,10 @@ async fn wait_connected(r: &Relay, timeout: Duration) {
     panic!("relay did not reach connected state in {:?}", timeout);
 }
 
-fn recv_within(rx: &mut tokio::sync::broadcast::Receiver<Event>, timeout: Duration) -> Option<Event> {
+fn recv_within(
+    rx: &mut tokio::sync::broadcast::Receiver<Event>,
+    timeout: Duration,
+) -> Option<Event> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Ok(ev) = rx.try_recv() {
@@ -83,9 +86,16 @@ async fn terminal_events_stay_in_one_process() {
 
     let mut local_rx = a.subscribe();
     let mut remote_rx = b.subscribe();
-    a.publish(Event::new("terminal.output", "w1", json!({"chunk": "ls\n"})));
+    a.publish(Event::new(
+        "terminal.output",
+        "w1",
+        json!({"chunk": "ls\n"}),
+    ));
 
-    assert!(recv_within(&mut local_rx, Duration::from_secs(1)).is_some(), "local delivery");
+    assert!(
+        recv_within(&mut local_rx, Duration::from_secs(1)).is_some(),
+        "local delivery"
+    );
     assert!(
         recv_within(&mut remote_rx, Duration::from_secs(1)).is_none(),
         "terminal events must not cross processes"

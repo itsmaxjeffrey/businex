@@ -58,7 +58,9 @@ pub fn validate_endpoint(base_url: &str) -> Result<(), ModelError> {
                 std::net::IpAddr::V4(v4) => {
                     v4.is_private() || v4.is_link_local() || v4.is_loopback() || v4.is_broadcast()
                 }
-                std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80,
+                std::net::IpAddr::V6(v6) => {
+                    v6.is_loopback() || (v6.segments()[0] & 0xffc0) == 0xfe80
+                }
             };
             if blocked {
                 return Err(ModelError::Config(

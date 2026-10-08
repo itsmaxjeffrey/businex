@@ -130,7 +130,14 @@ pub async fn create_session(
 /// Resolve a raw session token to its user. Expired or revoked sessions are
 /// rejected and removed from consideration.
 pub async fn user_from_token(pool: &PgPool, token: &str) -> Result<(CurrentUser, Uuid), AuthError> {
-    let row: (Uuid, Uuid, String, String, DateTime<Utc>, Option<DateTime<Utc>>) = sqlx::query_as(
+    let row: (
+        Uuid,
+        Uuid,
+        String,
+        String,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    ) = sqlx::query_as(
         r#"
         SELECT s.id, u.id, u.email, u.name, s.expires_at, s.revoked_at
         FROM sessions s JOIN users u ON u.id = s.user_id

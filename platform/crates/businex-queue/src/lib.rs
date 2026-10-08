@@ -631,7 +631,11 @@ pub async fn fire_due_schedules(pool: &PgPool) -> Result<Vec<(JobSchedule, Job)>
     let mut fired = Vec::new();
     for schedule in due {
         let next = compute_next_run(&schedule)?;
-        let key = format!("schedule:{}:{}", schedule.id, schedule.next_run_at.to_rfc3339());
+        let key = format!(
+            "schedule:{}:{}",
+            schedule.id,
+            schedule.next_run_at.to_rfc3339()
+        );
         let inserted = sqlx::query_as::<_, Job>(
             r#"
             WITH ins AS (
@@ -689,10 +693,7 @@ fn compute_next_run(schedule: &JobSchedule) -> Result<DateTime<Utc>, QueueError>
 /// Cancel a job inside a caller-provided tenant transaction. Row level
 /// security applies: a company context can only cancel its own jobs, and a
 /// foreign job id simply matches no row (not found).
-pub async fn cancel_scoped(
-    conn: &mut sqlx::PgConnection,
-    job_id: Uuid,
-) -> Result<Job, QueueError> {
+pub async fn cancel_scoped(conn: &mut sqlx::PgConnection, job_id: Uuid) -> Result<Job, QueueError> {
     let job = sqlx::query_as::<_, Job>(
         r#"
         WITH canceled AS (
@@ -740,9 +741,11 @@ pub async fn create_schedule(pool: &PgPool, new: NewSchedule) -> Result<JobSched
     let now = Utc::now();
     let next_run_at = match (&new.cron, new.interval_seconds) {
         (Some(expr), _) => {
-            let cron = CronExpr::parse(expr).map_err(|e| QueueError::InvalidSchedule(e.to_string()))?;
-            cron.next_after(now)
-                .ok_or_else(|| QueueError::InvalidSchedule("cron schedule has no future run".into()))?
+            let cron =
+                CronExpr::parse(expr).map_err(|e| QueueError::InvalidSchedule(e.to_string()))?;
+            cron.next_after(now).ok_or_else(|| {
+                QueueError::InvalidSchedule("cron schedule has no future run".into())
+            })?
         }
         (None, Some(_)) => now,
         (None, None) => unreachable!(),

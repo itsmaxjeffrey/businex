@@ -8,8 +8,8 @@
 use businex_db::TestDb;
 use businex_queue::{
     cancel, claim, complete, create_schedule, enqueue, fail, fire_due_schedules, get_job,
-    heartbeat, is_canceled, pending_effects, record_effect, reclaim_expired, resolve_effect,
-    EnqueueOutcome, EffectOutcome, JobState, NewJob, NewSchedule, QueueError,
+    heartbeat, is_canceled, pending_effects, reclaim_expired, record_effect, resolve_effect,
+    EffectOutcome, EnqueueOutcome, JobState, NewJob, NewSchedule, QueueError,
 };
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -60,14 +60,22 @@ async fn enqueue_and_claim_roundtrip() {
     };
     assert_eq!(job.state(), JobState::Queued);
 
-    let claimed = claim(&pool, "worker-1", &[kind.clone()], std::time::Duration::from_secs(30))
-        .await
-        .expect("claim")
-        .expect("a claimable job");
+    let claimed = claim(
+        &pool,
+        "worker-1",
+        &[kind.clone()],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("claim")
+    .expect("a claimable job");
     assert_eq!(claimed.id, job.id);
     assert_eq!(claimed.state(), JobState::Leased);
     assert_eq!(claimed.attempts, 1);
-    assert!(claimed.lease_token.is_some(), "claims carry a fencing token");
+    assert!(
+        claimed.lease_token.is_some(),
+        "claims carry a fencing token"
+    );
 
     let done = complete(&pool, &claimed, json!({"ok": true}))
         .await
@@ -118,10 +126,15 @@ async fn expired_lease_is_reclaimed_after_worker_death() {
     };
 
     // Worker claims with a very short lease, then "dies" without completing.
-    let claimed = claim(&pool, "dead-worker", &[kind.clone()], std::time::Duration::from_millis(100))
-        .await
-        .expect("claim")
-        .expect("claimable");
+    let claimed = claim(
+        &pool,
+        "dead-worker",
+        &[kind.clone()],
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
     assert_eq!(claimed.id, job.id);
 
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -132,10 +145,15 @@ async fn expired_lease_is_reclaimed_after_worker_death() {
     );
 
     // Another worker picks it up: the work survives a worker restart.
-    let again = claim(&pool, "fresh-worker", &[kind.clone()], std::time::Duration::from_secs(30))
-        .await
-        .expect("claim")
-        .expect("reclaimable job");
+    let again = claim(
+        &pool,
+        "fresh-worker",
+        &[kind.clone()],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("claim")
+    .expect("reclaimable job");
     assert_eq!(again.id, job.id);
     assert_eq!(again.attempts, 2);
 }
@@ -156,18 +174,31 @@ async fn stale_attempt_with_same_worker_id_is_fenced() {
     // Attempt 1 by worker "w": lease expires, job is reclaimed and re-claimed
     // by the same worker id (attempt 2). The stale attempt must be fenced out
     // even though its worker id matches the current lease owner.
-    let attempt1 = claim(&pool, "w", &[kind.clone()], std::time::Duration::from_millis(100))
-        .await
-        .expect("claim")
-        .expect("claimable");
+    let attempt1 = claim(
+        &pool,
+        "w",
+        &[kind.clone()],
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     reclaim_expired(&pool).await.expect("reclaim");
-    let attempt2 = claim(&pool, "w", &[kind.clone()], std::time::Duration::from_secs(30))
-        .await
-        .expect("claim")
-        .expect("re-claimable");
+    let attempt2 = claim(
+        &pool,
+        "w",
+        &[kind.clone()],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("claim")
+    .expect("re-claimable");
     assert_eq!(attempt2.id, job.id);
-    assert_ne!(attempt1.lease_token, attempt2.lease_token, "each claim is a distinct attempt");
+    assert_ne!(
+        attempt1.lease_token, attempt2.lease_token,
+        "each claim is a distinct attempt"
+    );
 
     // Stale attempt 1 cannot complete or fail the job.
     assert!(matches!(
@@ -175,7 +206,13 @@ async fn stale_attempt_with_same_worker_id_is_fenced() {
         Err(QueueError::Fenced)
     ));
     assert!(matches!(
-        fail(&pool, &attempt1, "stale error", std::time::Duration::from_secs(0)).await,
+        fail(
+            &pool,
+            &attempt1,
+            "stale error",
+            std::time::Duration::from_secs(0)
+        )
+        .await,
         Err(QueueError::Fenced)
     ));
 
@@ -196,17 +233,24 @@ async fn expired_lease_cannot_complete_or_refresh() {
         .await
         .expect("enqueue");
 
-    let claimed = claim(&pool, "slow-worker", &[kind.clone()], std::time::Duration::from_millis(100))
-        .await
-        .expect("claim")
-        .expect("claimable");
+    let claimed = claim(
+        &pool,
+        "slow-worker",
+        &[kind.clone()],
+        std::time::Duration::from_millis(100),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     // The lease has expired but nothing reclaimed it yet: the attempt can no
     // longer refresh or complete it.
-    assert!(!heartbeat(&pool, &claimed, std::time::Duration::from_secs(30))
-        .await
-        .expect("heartbeat"));
+    assert!(
+        !heartbeat(&pool, &claimed, std::time::Duration::from_secs(30))
+            .await
+            .expect("heartbeat")
+    );
     assert!(matches!(
         complete(&pool, &claimed, json!({})).await,
         Err(QueueError::Fenced)
@@ -230,10 +274,15 @@ async fn retries_are_bounded_and_recorded() {
     };
 
     for attempt in 1..=2 {
-        let claimed = claim(&pool, "worker", &[kind.clone()], std::time::Duration::from_secs(30))
-            .await
-            .expect("claim")
-            .expect("claimable");
+        let claimed = claim(
+            &pool,
+            "worker",
+            &[kind.clone()],
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        .expect("claim")
+        .expect("claimable");
         assert_eq!(claimed.id, job.id);
         let outcome = fail(
             &pool,
@@ -246,7 +295,11 @@ async fn retries_are_bounded_and_recorded() {
         if attempt < 2 {
             assert_eq!(outcome.state(), JobState::Queued, "retry is scheduled");
         } else {
-            assert_eq!(outcome.state(), JobState::Failed, "bounded retries end in failed");
+            assert_eq!(
+                outcome.state(),
+                JobState::Failed,
+                "bounded retries end in failed"
+            );
         }
     }
     let final_job = get_job(&pool, job.id).await.expect("get").expect("row");
@@ -277,12 +330,21 @@ async fn cancellation_is_visible_and_truthful() {
         EnqueueOutcome::Enqueued(j) => j,
         _ => panic!("expected new job"),
     };
-    let claimed = claim(&pool, "worker", &[kind_r.clone()], std::time::Duration::from_secs(30))
-        .await
-        .expect("claim")
-        .expect("claimable");
+    let claimed = claim(
+        &pool,
+        "worker",
+        &[kind_r.clone()],
+        std::time::Duration::from_secs(30),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
     let flagged = cancel(&pool, running.id).await.expect("cancel");
-    assert_eq!(flagged.state(), JobState::Leased, "leased job keeps running state");
+    assert_eq!(
+        flagged.state(),
+        JobState::Leased,
+        "leased job keeps running state"
+    );
     assert!(is_canceled(&pool, running.id).await.expect("check"));
     // The worker notices and finishes; the recorded outcome is canceled.
     let done = complete(&pool, &claimed, json!({"stopped": true}))
@@ -295,9 +357,12 @@ async fn cancellation_is_visible_and_truthful() {
 async fn uncertain_external_outcomes_stay_reconcilable() {
     let (_db, pool) = test_pool().await;
     let company = new_company(&pool).await;
-    let job = match enqueue(&pool, NewJob::new(Some(company), uniq("webhook"), json!({})))
-        .await
-        .expect("enqueue")
+    let job = match enqueue(
+        &pool,
+        NewJob::new(Some(company), uniq("webhook"), json!({})),
+    )
+    .await
+    .expect("enqueue")
     {
         EnqueueOutcome::Enqueued(j) => j,
         _ => panic!("expected new job"),
@@ -325,7 +390,10 @@ async fn uncertain_external_outcomes_stay_reconcilable() {
     .await
     .expect("resolve");
     assert_eq!(resolved.outcome, "confirmed");
-    assert!(pending_effects(&pool, job.id).await.expect("pending").is_empty());
+    assert!(pending_effects(&pool, job.id)
+        .await
+        .expect("pending")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -379,7 +447,14 @@ async fn schedules_fire_exactly_once() {
         "same fire time must not duplicate the job"
     );
     let still = get_job(&pool, job_id).await.expect("get").expect("row");
-    assert_eq!(still.idempotency_key, Some(format!("schedule:{}:{}", schedule.id, schedule.next_run_at.to_rfc3339())));
+    assert_eq!(
+        still.idempotency_key,
+        Some(format!(
+            "schedule:{}:{}",
+            schedule.id,
+            schedule.next_run_at.to_rfc3339()
+        ))
+    );
 }
 
 #[tokio::test]
@@ -398,6 +473,9 @@ async fn cron_schedules_advance_to_the_next_match() {
     )
     .await
     .expect("create");
-    assert!(schedule.next_run_at > Utc::now(), "cron schedules start in the future");
+    assert!(
+        schedule.next_run_at > Utc::now(),
+        "cron schedules start in the future"
+    );
     assert!(schedule.next_run_at <= Utc::now() + Duration::hours(24));
 }

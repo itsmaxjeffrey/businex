@@ -65,7 +65,10 @@ mod tests {
             2_000_000
         );
         assert_eq!(
-            table.get("compatible-gateway", "m").unwrap().input_micros_per_mtok,
+            table
+                .get("compatible-gateway", "m")
+                .unwrap()
+                .input_micros_per_mtok,
             1
         );
     }

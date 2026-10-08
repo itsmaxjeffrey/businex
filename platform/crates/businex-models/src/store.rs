@@ -134,14 +134,12 @@ pub async fn reserve(
     }
 
     let reservation_id = Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO model_reservations (id, company_id, tokens) VALUES ($1, $2, $3)",
-    )
-    .bind(reservation_id)
-    .bind(company_id)
-    .bind(estimate_tokens)
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("INSERT INTO model_reservations (id, company_id, tokens) VALUES ($1, $2, $3)")
+        .bind(reservation_id)
+        .bind(company_id)
+        .bind(estimate_tokens)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE model_budgets SET reserved_tokens = reserved_tokens + $2, updated_at = now()
          WHERE company_id = $1",

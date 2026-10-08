@@ -87,10 +87,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     secret.as_deref(),
                 ))
             }
-            Err(_) => {
-                std::sync::Arc::new(businex_api::ratelimit::MemoryRateLimiter::new())
-            }
+            Err(_) => std::sync::Arc::new(businex_api::ratelimit::MemoryRateLimiter::new()),
         };
+
+    // Absent settings disable OIDC; anything partial or invalid must fail
+    // startup instead of silently degrading to "disabled". The loader's
+    // errors are fixed, sanitized strings, so nothing secret is ever logged.
+    let oidc_rt = match businex_api::oidc::load_from_env() {
+        Ok(rt) => rt,
+        Err(err) => {
+            tracing::error!(error = %err, "oidc configuration is invalid");
+            return Err(err.into());
+        }
+    };
+    if oidc_rt.is_none() {
+        tracing::info!("oidc not configured; /api/auth/oidc/* stays disabled");
+    }
 
     let app = router(AppState {
         pool: pool.clone(),
@@ -98,6 +110,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: Instant::now(),
         config,
         rate_limiter,
+        oidc: oidc_rt,
     });
 
     let addr = format!("{}:{}", host, port);

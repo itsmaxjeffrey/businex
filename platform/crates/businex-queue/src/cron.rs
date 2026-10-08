@@ -27,10 +27,7 @@ impl CronExpr {
     pub fn parse(expr: &str) -> Result<CronExpr, CronError> {
         let parts: Vec<&str> = expr.split_whitespace().collect();
         if parts.len() != 5 {
-            return Err(CronError(format!(
-                "expected 5 fields, got {}",
-                parts.len()
-            )));
+            return Err(CronError(format!("expected 5 fields, got {}", parts.len())));
         }
         let dom_star = parts[2] == "*";
         let dow_star = parts[4] == "*";
@@ -56,7 +53,9 @@ impl CronExpr {
             return false;
         }
         let dom_ok = self.doms.contains(&(t.day() as u32));
-        let dow_ok = self.dows.contains(&(t.weekday().num_days_from_sunday() as u32));
+        let dow_ok = self
+            .dows
+            .contains(&(t.weekday().num_days_from_sunday() as u32));
         let day_ok = match (self.dom_star, self.dow_star) {
             (true, true) => true,
             (false, true) => dom_ok,
@@ -104,8 +103,10 @@ fn parse_field(spec: &str, min: u32, max: u32) -> Result<BTreeSet<u32>, CronErro
             r => {
                 if let Some((a, b)) = r.split_once('-') {
                     (
-                        a.parse().map_err(|_| CronError(format!("bad value in {}", part)))?,
-                        b.parse().map_err(|_| CronError(format!("bad value in {}", part)))?,
+                        a.parse()
+                            .map_err(|_| CronError(format!("bad value in {}", part)))?,
+                        b.parse()
+                            .map_err(|_| CronError(format!("bad value in {}", part)))?,
                     )
                 } else {
                     let v: u32 = r
@@ -145,21 +146,33 @@ mod tests {
     #[test]
     fn fixed_time_daily() {
         let c = CronExpr::parse("30 6 * * *").unwrap();
-        assert_eq!(c.next_after(t(2026, 1, 1, 0, 0)), Some(t(2026, 1, 1, 6, 30)));
-        assert_eq!(c.next_after(t(2026, 1, 1, 6, 30)), Some(t(2026, 1, 2, 6, 30)));
+        assert_eq!(
+            c.next_after(t(2026, 1, 1, 0, 0)),
+            Some(t(2026, 1, 1, 6, 30))
+        );
+        assert_eq!(
+            c.next_after(t(2026, 1, 1, 6, 30)),
+            Some(t(2026, 1, 2, 6, 30))
+        );
     }
 
     #[test]
     fn step_values() {
         let c = CronExpr::parse("*/15 * * * *").unwrap();
-        assert_eq!(c.next_after(t(2026, 1, 1, 0, 7)), Some(t(2026, 1, 1, 0, 15)));
+        assert_eq!(
+            c.next_after(t(2026, 1, 1, 0, 7)),
+            Some(t(2026, 1, 1, 0, 15))
+        );
     }
 
     #[test]
     fn ranges_and_lists() {
         let c = CronExpr::parse("0 9-17 * * 1-5").unwrap();
         // 2026-01-03 is a Saturday: next match is Monday 09:00.
-        assert_eq!(c.next_after(t(2026, 1, 3, 12, 0)), Some(t(2026, 1, 5, 9, 0)));
+        assert_eq!(
+            c.next_after(t(2026, 1, 3, 12, 0)),
+            Some(t(2026, 1, 5, 9, 0))
+        );
     }
 
     #[test]

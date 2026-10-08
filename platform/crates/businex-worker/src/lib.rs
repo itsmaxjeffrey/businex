@@ -80,7 +80,11 @@ impl JobContext {
     }
 
     /// Record an external side effect before calling out; resolve it after.
-    pub async fn record_effect(&self, key: &str, request_hash: &str) -> Result<JobEffect, QueueError> {
+    pub async fn record_effect(
+        &self,
+        key: &str,
+        request_hash: &str,
+    ) -> Result<JobEffect, QueueError> {
         queue::record_effect(&self.pool, self.job.id, key, request_hash).await
     }
 
@@ -285,29 +289,53 @@ impl Worker {
 
         let report = match run_result {
             Some(Ok(value)) => match queue::complete(&self.pool, &ctx.job, value).await {
-                Ok(done) => JobReport { job_id: job.id, outcome: done.state },
-                Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
+                Ok(done) => JobReport {
+                    job_id: job.id,
+                    outcome: done.state,
+                },
+                Err(QueueError::Fenced) => JobReport {
+                    job_id: job.id,
+                    outcome: "fenced".into(),
+                },
                 Err(err) => return Err(err),
             },
             Some(Err(HandlerError::Fatal(reason))) if reason == "canceled" => {
                 match queue::complete(&self.pool, &ctx.job, Value::Null).await {
-                    Ok(done) => JobReport { job_id: job.id, outcome: done.state },
-                    Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
+                    Ok(done) => JobReport {
+                        job_id: job.id,
+                        outcome: done.state,
+                    },
+                    Err(QueueError::Fenced) => JobReport {
+                        job_id: job.id,
+                        outcome: "fenced".into(),
+                    },
                     Err(err) => return Err(err),
                 }
             }
             Some(Err(HandlerError::Fatal(reason))) => {
                 match queue::fail_permanent(&self.pool, &ctx.job, &reason).await {
-                    Ok(done) => JobReport { job_id: job.id, outcome: done.state },
-                    Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
+                    Ok(done) => JobReport {
+                        job_id: job.id,
+                        outcome: done.state,
+                    },
+                    Err(QueueError::Fenced) => JobReport {
+                        job_id: job.id,
+                        outcome: "fenced".into(),
+                    },
                     Err(err) => return Err(err),
                 }
             }
             Some(Err(HandlerError::Retryable(reason))) => {
                 let backoff = Duration::from_secs_f64((2f64.powi(job.attempts.min(6))).min(60.0));
                 match queue::fail(&self.pool, &ctx.job, &reason, backoff).await {
-                    Ok(done) => JobReport { job_id: job.id, outcome: done.state },
-                    Err(QueueError::Fenced) => JobReport { job_id: job.id, outcome: "fenced".into() },
+                    Ok(done) => JobReport {
+                        job_id: job.id,
+                        outcome: done.state,
+                    },
+                    Err(QueueError::Fenced) => JobReport {
+                        job_id: job.id,
+                        outcome: "fenced".into(),
+                    },
                     Err(err) => return Err(err),
                 }
             }
@@ -318,13 +346,20 @@ impl Worker {
                 // a still-valid lease is closed out as canceled.
                 match queue::is_canceled(&self.pool, job.id).await {
                     Ok(true) => match queue::complete(&self.pool, &ctx.job, Value::Null).await {
-                        Ok(done) => JobReport { job_id: job.id, outcome: done.state },
-                        Err(QueueError::Fenced) => {
-                            JobReport { job_id: job.id, outcome: "abandoned".into() }
-                        }
+                        Ok(done) => JobReport {
+                            job_id: job.id,
+                            outcome: done.state,
+                        },
+                        Err(QueueError::Fenced) => JobReport {
+                            job_id: job.id,
+                            outcome: "abandoned".into(),
+                        },
                         Err(err) => return Err(err),
                     },
-                    _ => JobReport { job_id: job.id, outcome: "abandoned".into() },
+                    _ => JobReport {
+                        job_id: job.id,
+                        outcome: "abandoned".into(),
+                    },
                 }
             }
         };

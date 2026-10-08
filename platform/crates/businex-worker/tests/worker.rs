@@ -4,7 +4,7 @@
 use async_trait::async_trait;
 use businex_db::TestDb;
 use businex_events::{Relay, RelayOptions};
-use businex_queue::{enqueue, EnqueueOutcome, NewJob, JobState};
+use businex_queue::{enqueue, EnqueueOutcome, JobState, NewJob};
 use businex_worker::{HandlerError, JobContext, JobHandler, Worker};
 use serde_json::json;
 use sqlx::PgPool;
@@ -88,7 +88,10 @@ async fn run_once_executes_handler_and_completes() {
     assert_eq!(report.outcome, "succeeded");
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 
-    let job = businex_queue::get_job(&pool, report.job_id).await.expect("get").expect("row");
+    let job = businex_queue::get_job(&pool, report.job_id)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(job.state(), JobState::Succeeded);
     assert_eq!(job.result, Some(json!({"runs": 1})));
 
@@ -121,7 +124,11 @@ async fn duplicate_enqueue_never_runs_twice() {
     assert!(worker.run_once().await.expect("cycle").is_some());
     assert!(worker.run_once().await.expect("cycle").is_none());
     assert!(worker.run_once().await.expect("cycle").is_none());
-    assert_eq!(runs.load(Ordering::SeqCst), 1, "duplicate enqueue must run once");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "duplicate enqueue must run once"
+    );
 }
 
 #[tokio::test]
@@ -137,10 +144,15 @@ async fn crash_before_completion_is_recovered_exactly_once() {
     };
 
     // A worker claims the job and dies: no completion, lease expires.
-    businex_queue::claim(&pool, "crashed-worker", &["t3".into()], Duration::from_millis(100))
-        .await
-        .expect("claim")
-        .expect("claimable");
+    businex_queue::claim(
+        &pool,
+        "crashed-worker",
+        &["t3".into()],
+        Duration::from_millis(100),
+    )
+    .await
+    .expect("claim")
+    .expect("claimable");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // A restarted worker recovers the job and runs it exactly once.
@@ -156,8 +168,15 @@ async fn crash_before_completion_is_recovered_exactly_once() {
     let report = worker.run_once().await.expect("cycle").expect("recovered");
     assert_eq!(report.job_id, job.id);
     assert_eq!(report.outcome, "succeeded");
-    assert_eq!(runs.load(Ordering::SeqCst), 1, "recovery must not duplicate execution");
-    let done = businex_queue::get_job(&pool, job.id).await.expect("get").expect("row");
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "recovery must not duplicate execution"
+    );
+    let done = businex_queue::get_job(&pool, job.id)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(done.attempts, 2, "crashed attempt is counted");
 }
 
@@ -178,15 +197,26 @@ async fn retryable_errors_requeue_then_succeed() {
             behavior: Behavior::RetryOnce,
         }),
     );
-    let first = worker.run_once().await.expect("cycle").expect("first attempt");
+    let first = worker
+        .run_once()
+        .await
+        .expect("cycle")
+        .expect("first attempt");
     assert_eq!(first.outcome, "queued", "retryable failure requeues");
 
     // Give the backoff window a moment; backoff for attempt 1 is 2 seconds.
     tokio::time::sleep(Duration::from_millis(2100)).await;
-    let second = worker.run_once().await.expect("cycle").expect("second attempt");
+    let second = worker
+        .run_once()
+        .await
+        .expect("cycle")
+        .expect("second attempt");
     assert_eq!(second.outcome, "succeeded");
     assert_eq!(runs.load(Ordering::SeqCst), 2);
-    let job = businex_queue::get_job(&pool, second.job_id).await.expect("get").expect("row");
+    let job = businex_queue::get_job(&pool, second.job_id)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(job.attempts, 2);
 }
 
@@ -209,7 +239,10 @@ async fn fatal_errors_fail_without_retry() {
     );
     let report = worker.run_once().await.expect("cycle").expect("attempt");
     assert_eq!(report.outcome, "failed");
-    assert!(worker.run_once().await.expect("cycle").is_none(), "no retry for fatal errors");
+    assert!(
+        worker.run_once().await.expect("cycle").is_none(),
+        "no retry for fatal errors"
+    );
     assert_eq!(runs.load(Ordering::SeqCst), 1);
 }
 
@@ -235,7 +268,10 @@ async fn canceled_jobs_never_execute() {
             behavior: Behavior::Succeed,
         }),
     );
-    assert!(worker.run_once().await.expect("cycle").is_none(), "canceled job is not claimed");
+    assert!(
+        worker.run_once().await.expect("cycle").is_none(),
+        "canceled job is not claimed"
+    );
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 }
 
@@ -306,7 +342,11 @@ async fn pending_external_effects_block_blind_retry() {
             behavior: Behavior::Succeed,
         }),
     );
-    let report = worker.run_once().await.expect("cycle").expect("recovered job");
+    let report = worker
+        .run_once()
+        .await
+        .expect("cycle")
+        .expect("recovered job");
     assert_eq!(report.outcome, "failed", "blind retry must be refused");
     assert_eq!(runs.load(Ordering::SeqCst), 0);
 
@@ -335,12 +375,20 @@ async fn pending_external_effects_block_blind_retry() {
     let mut reconciling = Worker::new(pool.clone(), relay)
         .with_lease(Duration::from_secs(30))
         .with_poll_interval(Duration::from_millis(10));
-    reconciling.register("t8", Arc::new(Reconciler { runs: runs2.clone() }));
-    let report2 = reconciling.run_once().await.expect("cycle").expect("reconciled job");
+    reconciling.register(
+        "t8",
+        Arc::new(Reconciler {
+            runs: runs2.clone(),
+        }),
+    );
+    let report2 = reconciling
+        .run_once()
+        .await
+        .expect("cycle")
+        .expect("reconciled job");
     assert_eq!(report2.outcome, "succeeded");
     assert_eq!(runs2.load(Ordering::SeqCst), 1);
 }
-
 
 // ---------------------------------------------------------------------------
 // Lease loss and cancellation must stop handler work before side effects.
@@ -420,7 +468,10 @@ async fn lease_loss_stops_handler_before_side_effects() {
         .expect("join")
         .expect("cycle")
         .expect("job ran");
-    assert_eq!(report.outcome, "abandoned", "stolen lease must abandon the attempt");
+    assert_eq!(
+        report.outcome, "abandoned",
+        "stolen lease must abandon the attempt"
+    );
     assert!(
         !effect_written.load(Ordering::SeqCst),
         "handler side effects must not run after lease loss"
@@ -476,7 +527,10 @@ async fn cancellation_stops_handler_before_side_effects() {
         .expect("join")
         .expect("cycle")
         .expect("job ran");
-    assert_eq!(report.outcome, "canceled", "canceled execution ends canceled");
+    assert_eq!(
+        report.outcome, "canceled",
+        "canceled execution ends canceled"
+    );
     assert!(
         !effect_written.load(Ordering::SeqCst),
         "handler side effects must not run after cancellation"
@@ -504,4 +558,3 @@ async fn cancellation_stops_handler_before_side_effects() {
         .lease_expires_at;
     assert_eq!(before, after, "heartbeat must stop when the attempt ends");
 }
-

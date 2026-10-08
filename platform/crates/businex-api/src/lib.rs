@@ -17,6 +17,7 @@ use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetReques
 use tower_http::trace::TraceLayer;
 
 pub mod auth;
+pub mod oidc;
 pub mod ratelimit;
 pub mod routes_identity;
 
@@ -48,21 +49,19 @@ pub struct AppState {
     pub started_at: Instant,
     pub config: AppConfig,
     pub rate_limiter: std::sync::Arc<dyn ratelimit::RateLimiter>,
+    pub oidc: Option<oidc::OidcRuntime>,
 }
 
 impl AppState {
     /// In-process limiter default for tests and single-node development.
-    pub fn with_memory_limiter(
-        pool: sqlx::PgPool,
-        relay: Relay,
-        config: AppConfig,
-    ) -> Self {
+    pub fn with_memory_limiter(pool: sqlx::PgPool, relay: Relay, config: AppConfig) -> Self {
         AppState {
             pool,
             relay,
             started_at: Instant::now(),
             config,
             rate_limiter: std::sync::Arc::new(ratelimit::MemoryRateLimiter::new()),
+            oidc: None,
         }
     }
 }
@@ -74,12 +73,10 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/api/health", get(api_health))
         .merge(routes_identity::router())
+        .merge(oidc::router())
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
-        .layer(SetRequestIdLayer::new(
-            x_request_id,
-            MakeRequestUuid,
-        ))
+        .layer(SetRequestIdLayer::new(x_request_id, MakeRequestUuid))
         .with_state(state)
 }
 
@@ -142,8 +139,8 @@ fn redis_label(status: Status) -> &'static str {
 /// secrets, tokens, passwords, raw provider errors or full request headers.
 pub fn init_tracing(default_level: &str) {
     use tracing_subscriber::EnvFilter;
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(default_level));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .json()
@@ -167,7 +164,8 @@ pub fn error_response(err: &businex_core::Error) -> Response {
     };
     let mut resp = (code, Json(json!({"error": message}))).into_response();
     if let Ok(value) = HeaderValue::from_str("application/json") {
-        resp.headers_mut().insert(axum::http::header::CONTENT_TYPE, value);
+        resp.headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, value);
     }
     resp
 }

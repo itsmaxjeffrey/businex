@@ -95,7 +95,11 @@ impl BudgetLedger {
 
     /// Atomically reserve capacity for one call. The check and the reservation
     /// happen under one lock, so concurrent calls cannot double-spend.
-    pub fn reserve(&self, company_id: Uuid, estimate_tokens: u64) -> Result<Reservation, BudgetDecision> {
+    pub fn reserve(
+        &self,
+        company_id: Uuid,
+        estimate_tokens: u64,
+    ) -> Result<Reservation, BudgetDecision> {
         let mut guard = self.budgets.lock().expect("ledger lock");
         let (budget, totals) = guard.entry(company_id).or_default();
         let committed_tokens = totals.settled_tokens + totals.reserved_tokens + estimate_tokens;
@@ -138,8 +142,7 @@ impl BudgetLedger {
             totals.settled_tokens = totals.settled_tokens.saturating_add(observed);
             match cost {
                 Cost::Known { micros } if micros >= 0 => {
-                    totals.settled_cost_micros =
-                        totals.settled_cost_micros.saturating_add(micros);
+                    totals.settled_cost_micros = totals.settled_cost_micros.saturating_add(micros);
                 }
                 _ => totals.unknown_cost_calls += 1,
             }
@@ -180,10 +183,7 @@ mod tests {
         let r = ledger.reserve(company, 1000).expect("reserve");
         ledger.settle(r, Some(Usage::of(600, 400)), Cost::Unknown);
         let denied = ledger.reserve(company, 1);
-        assert!(matches!(
-            denied,
-            Err(BudgetDecision::DenyTokens { .. })
-        ));
+        assert!(matches!(denied, Err(BudgetDecision::DenyTokens { .. })));
     }
 
     #[test]

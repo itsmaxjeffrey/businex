@@ -181,7 +181,9 @@ impl ModelAdapter for OpenAiAdapter {
                 if let Some(u) = Self::parse_usage(&data["usage"]) {
                     *usage = Some(u);
                 }
-                let delta = data["choices"][0]["delta"]["content"].as_str().unwrap_or("");
+                let delta = data["choices"][0]["delta"]["content"]
+                    .as_str()
+                    .unwrap_or("");
                 if !delta.is_empty() {
                     out.push(StreamEvent::Delta {
                         text: delta.to_string(),

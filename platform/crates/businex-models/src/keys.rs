@@ -131,7 +131,8 @@ mod tests {
             .expect("seal");
         assert!(!sealed.ciphertext.is_empty());
         assert_eq!(
-            m.open("co-1".into(), "openai".into(), &sealed).expect("open"),
+            m.open("co-1".into(), "openai".into(), &sealed)
+                .expect("open"),
             "test-key-material"
         );
     }
@@ -192,8 +193,12 @@ mod tests {
     #[test]
     fn random_nonces_differ_per_seal() {
         let m = master();
-        let a = m.seal("co-1".into(), "openai".into(), "sk".into()).expect("a");
-        let b = m.seal("co-1".into(), "openai".into(), "sk".into()).expect("b");
+        let a = m
+            .seal("co-1".into(), "openai".into(), "sk".into())
+            .expect("a");
+        let b = m
+            .seal("co-1".into(), "openai".into(), "sk".into())
+            .expect("b");
         assert_ne!(a.nonce, b.nonce, "nonces must be random per seal");
         assert_ne!(a.ciphertext, b.ciphertext);
     }

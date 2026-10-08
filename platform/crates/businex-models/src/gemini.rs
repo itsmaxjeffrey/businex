@@ -68,7 +68,11 @@ impl GeminiAdapter {
         if let Some(t) = request.temperature {
             generation["temperature"] = json!(t);
         }
-        if generation.as_object().map(|o| !o.is_empty()).unwrap_or(false) {
+        if generation
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false)
+        {
             body["generationConfig"] = generation;
         }
         body

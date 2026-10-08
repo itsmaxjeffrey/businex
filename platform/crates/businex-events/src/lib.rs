@@ -238,7 +238,11 @@ impl Relay {
 
     fn client(&self) -> Option<redis::Client> {
         self.inner.opts.url.as_ref().and_then(|url| {
-            redis::Client::open(build_connection_info(url, self.inner.opts.password.as_deref())).ok()
+            redis::Client::open(build_connection_info(
+                url,
+                self.inner.opts.password.as_deref(),
+            ))
+            .ok()
         })
     }
 
@@ -248,9 +252,7 @@ impl Relay {
         let mut last = self.inner.last_warn.lock().unwrap();
         if last.map(|t| t.elapsed() >= WARN_INTERVAL).unwrap_or(true) {
             *last = Some(Instant::now());
-            tracing::warn!(
-                "redis unavailable; live updates are local to this process"
-            );
+            tracing::warn!("redis unavailable; live updates are local to this process");
         }
     }
 }

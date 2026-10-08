@@ -2,11 +2,11 @@
 //! response parsing, streaming across awkward chunk boundaries, explicit
 //! unknown usage/cost, sanitized errors and endpoint policy.
 
+use axum::response::IntoResponse;
 use businex_models::{
     AnthropicAdapter, Cost, GeminiAdapter, ModelAdapter, ModelError, ModelRequest, OpenAiAdapter,
     Price, StreamEvent, Usage,
 };
-use axum::response::IntoResponse;
 use futures::StreamExt;
 use serde_json::json;
 
@@ -242,7 +242,11 @@ async fn missing_usage_is_unknown_not_zero() {
         .await
         .expect("complete");
     assert_eq!(resp.usage, None, "absent usage stays absent, not zeros");
-    assert_eq!(resp.cost, Cost::Unknown, "unknown usage forces unknown cost");
+    assert_eq!(
+        resp.cost,
+        Cost::Unknown,
+        "unknown usage forces unknown cost"
+    );
     handle.abort();
 }
 
@@ -285,9 +289,7 @@ async fn stream_survives_arbitrary_chunk_boundaries() {
     let source = futures::stream::iter(chunks);
     let stream = businex_models::sse::parse(
         source,
-        |data: &serde_json::Value,
-         usage: &mut Option<Usage>,
-         out: &mut Vec<StreamEvent>| {
+        |data: &serde_json::Value, usage: &mut Option<Usage>, out: &mut Vec<StreamEvent>| {
             if data.get("usage").map(|u| !u.is_null()).unwrap_or(false) {
                 *usage = Some(Usage::default());
             }
@@ -317,7 +319,10 @@ async fn provider_error_frames_surface_stream_error() {
         None,
     )
     .expect("adapter");
-    let stream = adapter.stream(ModelRequest::chat("hi")).await.expect("stream");
+    let stream = adapter
+        .stream(ModelRequest::chat("hi"))
+        .await
+        .expect("stream");
     let (text, _usage, _done, error) = collect(stream).await;
     assert_eq!(text, "part", "deltas before the error are kept");
     assert!(
@@ -337,7 +342,10 @@ async fn premature_eof_is_not_a_free_success() {
         price(),
     )
     .expect("adapter");
-    let stream = adapter.stream(ModelRequest::chat("hi")).await.expect("stream");
+    let stream = adapter
+        .stream(ModelRequest::chat("hi"))
+        .await
+        .expect("stream");
     let (_text, usage, done, error) = collect(stream).await;
     assert!(error.is_none());
     assert!(!done, "no [DONE] marker means the stream was cut");
@@ -360,7 +368,10 @@ async fn anthropic_complete_and_stream() {
     assert_eq!(resp.usage, Some(Usage::of(5, 1)));
     assert_eq!(resp.provider, "anthropic");
 
-    let stream = adapter.stream(ModelRequest::chat("hi")).await.expect("stream");
+    let stream = adapter
+        .stream(ModelRequest::chat("hi"))
+        .await
+        .expect("stream");
     let (text, usage, done, error) = collect(stream).await;
     assert_eq!(text, "Hi");
     assert_eq!(usage, Some(Usage::of(5, 1)));

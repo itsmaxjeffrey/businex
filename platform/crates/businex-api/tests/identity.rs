@@ -35,7 +35,12 @@ impl Client {
         Client { app, cookie: None }
     }
 
-    async fn call(&mut self, method: &str, uri: &str, body: Option<Value>) -> (StatusCode, Value, Option<String>) {
+    async fn call(
+        &mut self,
+        method: &str,
+        uri: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value, Option<String>) {
         let mut builder = Request::builder()
             .method(method)
             .uri(uri)
@@ -125,13 +130,19 @@ async fn register_login_me_logout_flow() {
     // Wrong password is rejected without a session.
     let mut other = Client::new(app_for(&state));
     let (status, _) = other
-        .post("/api/auth/login", json!({"email": addr, "password": "wrong password here"}))
+        .post(
+            "/api/auth/login",
+            json!({"email": addr, "password": "wrong password here"}),
+        )
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     // Correct password logs in and sets a session cookie.
     let (status, body) = other
-        .post("/api/auth/login", json!({"email": addr, "password": "correct horse battery"}))
+        .post(
+            "/api/auth/login",
+            json!({"email": addr, "password": "correct horse battery"}),
+        )
         .await;
     assert_eq!(status, StatusCode::OK, "{}", body);
 
@@ -139,7 +150,11 @@ async fn register_login_me_logout_flow() {
     let (status, _) = other.post("/api/auth/logout", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _) = other.get("/api/auth/me").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "session must be dead after logout");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "session must be dead after logout"
+    );
 }
 
 #[tokio::test]
@@ -195,7 +210,11 @@ async fn two_companies_two_roles_isolated() {
     let (status, _) = owner_b
         .get(&format!("/api/companies/{}/members", company_a))
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "cross-tenant read must be denied");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-tenant read must be denied"
+    );
 
     // Privilege denial: viewer cannot manage members (invite).
     let (status, _) = viewer_a
@@ -222,7 +241,11 @@ async fn two_companies_two_roles_isolated() {
             json!({"email": email("intruder"), "role": "admin"}),
         )
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "cross-tenant invite must be denied");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "cross-tenant invite must be denied"
+    );
 
     // Owner A cannot claim company B (nonexistent membership path).
     let (status, _) = owner_a
@@ -238,7 +261,9 @@ async fn invitation_token_is_single_use_and_bound_to_email() {
     let (mut invitee, invitee_email) = register(app_for(&state), "invitee").await;
     let (mut stranger, _) = register(app_for(&state), "stranger").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Gamma Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Gamma Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = co["id"].as_str().unwrap().to_string();
 
@@ -255,7 +280,11 @@ async fn invitation_token_is_single_use_and_bound_to_email() {
     let (status, _) = stranger
         .post("/api/invitations/accept", json!({"token": token.clone()}))
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "invitation is bound to its email");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "invitation is bound to its email"
+    );
 
     // The rightful invitee redeems it exactly once.
     let (status, _) = invitee
@@ -265,13 +294,16 @@ async fn invitation_token_is_single_use_and_bound_to_email() {
     let (status, _) = invitee
         .post("/api/invitations/accept", json!({"token": token}))
         .await;
-    assert_eq!(status, StatusCode::CONFLICT, "invitation must be single use");
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "invitation must be single use"
+    );
 }
 
 fn app_for(state: &AppState) -> axum::Router {
     router(state.clone())
 }
-
 
 // ---------------------------------------------------------------------------
 // Membership management: role changes, escalation denial, removal rules.
@@ -283,7 +315,9 @@ async fn role_changes_follow_the_matrix_and_refuse_escalation() {
     let (mut owner, _) = register(app_for(&state), "owner").await;
     let (mut member, member_email) = register(app_for(&state), "member").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Matrix Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Matrix Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = co["id"].as_str().unwrap().to_string();
     let (status, inv) = owner
@@ -308,7 +342,11 @@ async fn role_changes_follow_the_matrix_and_refuse_escalation() {
     let (status, _, _) = member
         .call("PATCH", &member_path, Some(json!({"role": "manager"})))
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "self-escalation must be denied");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "self-escalation must be denied"
+    );
 
     // The owner can promote; the change is visible in the member list.
     let (status, _, _) = owner
@@ -331,7 +369,11 @@ async fn role_changes_follow_the_matrix_and_refuse_escalation() {
     let (status, _, _) = owner
         .call("PATCH", &member_path, Some(json!({"role": "owner"})))
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "owner role is transfer-only");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "owner role is transfer-only"
+    );
 
     // The last owner can never demote themselves: the company must keep
     // at least one owner until ownership is transferred.
@@ -353,7 +395,9 @@ async fn role_changes_follow_the_matrix_and_refuse_escalation() {
 async fn last_owner_cannot_be_removed() {
     let (_db, state) = test_state().await;
     let (mut owner, _) = register(app_for(&state), "owner").await;
-    let (status, co) = owner.post("/api/companies", json!({"name": "Solo Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Solo Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = co["id"].as_str().unwrap().to_string();
     let (me_status, me) = owner.get("/api/auth/me").await;
@@ -374,7 +418,9 @@ async fn members_can_be_removed_with_audit() {
     let (mut owner, _) = register(app_for(&state), "owner").await;
     let (mut member, member_email) = register(app_for(&state), "member").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Churn Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Churn Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = co["id"].as_str().unwrap().to_string();
     let (status, inv) = owner
@@ -413,7 +459,9 @@ async fn grants_are_action_specific_revocable_and_role_bounded() {
     let (mut owner, _) = register(app_for(&state), "owner").await;
     let (mut member, member_email) = register(app_for(&state), "member").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Grants Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Grants Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = co["id"].as_str().unwrap().to_string();
     let (status, inv) = owner
@@ -444,7 +492,11 @@ async fn grants_are_action_specific_revocable_and_role_bounded() {
             }),
         )
         .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "members cannot create grants");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "members cannot create grants"
+    );
 
     // The owner grants exactly one read permission on one resource.
     let (status, grant) = owner
@@ -478,7 +530,11 @@ async fn grants_are_action_specific_revocable_and_role_bounded() {
             }),
         )
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown permission rejected");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "unknown permission rejected"
+    );
 
     // Revocation is immediate.
     let grant_id = pick_field(&grant, ["i", "d"]);
@@ -508,7 +564,11 @@ async fn expired_sessions_are_rejected() {
         .await
         .expect("expire sessions");
     let (status, _) = client.get("/api/auth/me").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "expired session must be rejected");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "expired session must be rejected"
+    );
 }
 
 #[tokio::test]
@@ -536,7 +596,6 @@ async fn auth_attempts_are_rate_limited() {
     assert!(saw_limit, "repeated failed logins must hit the rate limit");
 }
 
-
 // ---------------------------------------------------------------------------
 // Owner policy hardening: issuer ceiling, transfer-only owner rows,
 // atomic owner retention, malformed-role fail-closed, bounded grant expiry.
@@ -548,7 +607,9 @@ async fn admin_cannot_demote_or_remove_an_owner() {
     let (mut owner, _) = register(app_for(&state), "owner").await;
     let (mut admin, admin_email) = register(app_for(&state), "admin").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Ceiling Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Ceiling Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = pick_field(&co, ["i", "d"]);
     let (status, inv) = owner
@@ -606,7 +667,9 @@ async fn concurrent_owner_demotion_keeps_exactly_one_owner() {
     let (mut owner_a, _) = register(app_for(&state), "owner-a").await;
     let (mut owner_b, _) = register(app_for(&state), "owner-b").await;
 
-    let (status, co) = owner_a.post("/api/companies", json!({"name": "Duo Ltd"})).await;
+    let (status, co) = owner_a
+        .post("/api/companies", json!({"name": "Duo Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = pick_field(&co, ["i", "d"]);
 
@@ -671,7 +734,9 @@ async fn malformed_stored_role_fails_closed() {
     let (mut owner, _) = register(app_for(&state), "owner").await;
     let (mut member, member_email) = register(app_for(&state), "member").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Broken Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Broken Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = pick_field(&co, ["i", "d"]);
     let (status, inv) = owner
@@ -742,7 +807,9 @@ async fn malformed_stored_role_fails_closed() {
 async fn grant_expiry_is_bounded_and_checked() {
     let (_db, state) = test_state().await;
     let (mut owner, _) = register(app_for(&state), "owner").await;
-    let (status, co) = owner.post("/api/companies", json!({"name": "Expiry Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Expiry Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = pick_field(&co, ["i", "d"]);
     let grants_uri = format!("/api/companies/{}/grants", company);
@@ -808,7 +875,9 @@ async fn member_removal_above_issuer_is_denied_for_roles() {
     let (mut manager, manager_email) = register(app_for(&state), "manager").await;
     let (mut admin, admin_email) = register(app_for(&state), "admin").await;
 
-    let (status, co) = owner.post("/api/companies", json!({"name": "Ladder Ltd"})).await;
+    let (status, co) = owner
+        .post("/api/companies", json!({"name": "Ladder Ltd"}))
+        .await;
     assert_eq!(status, StatusCode::OK);
     let company = pick_field(&co, ["i", "d"]);
 

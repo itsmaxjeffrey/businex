@@ -91,7 +91,10 @@ impl RedisRateLimiter {
 
     fn warn_outage(&self) {
         let mut last = self.warned_at.lock().expect("warn lock");
-        if last.map(|t| t.elapsed() >= Duration::from_secs(30)).unwrap_or(true) {
+        if last
+            .map(|t| t.elapsed() >= Duration::from_secs(30))
+            .unwrap_or(true)
+        {
             *last = Some(Instant::now());
             tracing::warn!("rate limiter redis unavailable; using in-process fallback");
         }
@@ -111,8 +114,10 @@ impl RateLimiter for RedisRateLimiter {
             Ok(conn) => conn,
             Err(_) => return self.fallback_check(key, limit, window_secs).await,
         };
-        let count: Result<i64, redis::RedisError> =
-            redis::cmd("INCR").arg(&redis_key).query_async(&mut conn).await;
+        let count: Result<i64, redis::RedisError> = redis::cmd("INCR")
+            .arg(&redis_key)
+            .query_async(&mut conn)
+            .await;
         let count = match count {
             Ok(count) => count,
             Err(_) => return self.fallback_check(key, limit, window_secs).await,

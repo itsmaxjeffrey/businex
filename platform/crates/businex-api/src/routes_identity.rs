@@ -39,7 +39,10 @@ pub fn router() -> Router<AppState> {
             "/api/companies/{id}/grants",
             get(list_grants).post(create_grant),
         )
-        .route("/api/companies/{id}/grants/{grant_id}", axum::routing::delete(revoke_grant))
+        .route(
+            "/api/companies/{id}/grants/{grant_id}",
+            axum::routing::delete(revoke_grant),
+        )
         .route("/api/companies/{id}/invitations", post(create_invitation))
         .route("/api/invitations/accept", post(accept_invitation))
 }
@@ -53,9 +56,7 @@ fn map_auth(err: AuthError) -> Response {
             })
         }
         AuthError::Invalid(message) => error_response(&Error::Invalid { message }),
-        AuthError::Db(_) => error_response(&Error::Internal(
-            "database error".into(),
-        )),
+        AuthError::Db(_) => error_response(&Error::Internal("database error".into())),
     }
 }
 
@@ -90,9 +91,8 @@ async fn authorize(
             reason: "no membership in this company".into(),
         })
     })?;
-    let role = Role::parse(&role_str).ok_or_else(|| {
-        error_response(&Error::Internal("membership has unknown role".into()))
-    })?;
+    let role = Role::parse(&role_str)
+        .ok_or_else(|| error_response(&Error::Internal("membership has unknown role".into())))?;
     let resources: Vec<String> = scope
         .get("resources")
         .and_then(|v| v.as_array())
@@ -125,7 +125,8 @@ async fn authorize(
         role,
         scope: resource_scope,
     };
-    auth.check(action, resource).map_err(|e| error_response(&e))?;
+    auth.check(action, resource)
+        .map_err(|e| error_response(&e))?;
     Ok(auth)
 }
 
@@ -190,11 +191,14 @@ async fn finish_login_async(
     let (token, _expires) = create_session(&state.pool, user.id, ua.as_deref(), ttl)
         .await
         .map_err(map_auth)?;
-    let cookie = session_cookie(&token, state.config.session_ttl_secs, state.config.cookie_secure);
+    let cookie = session_cookie(
+        &token,
+        state.config.session_ttl_secs,
+        state.config.cookie_secure,
+    );
     let body = Json(json!({"user": user_json(user)}));
     let mut resp = (StatusCode::OK, body).into_response();
-    resp
-        .headers_mut()
+    resp.headers_mut()
         .insert("set-cookie", cookie.parse().expect("cookie header"));
     Ok(resp)
 }
@@ -241,7 +245,11 @@ async fn enforce_rate_limit(
 ) -> Result<(), Response> {
     match state
         .rate_limiter
-        .check(&rate_key(headers, email), AUTH_RATE_LIMIT, AUTH_RATE_WINDOW_SECS)
+        .check(
+            &rate_key(headers, email),
+            AUTH_RATE_LIMIT,
+            AUTH_RATE_WINDOW_SECS,
+        )
         .await
     {
         RateDecision::Allow { .. } => Ok(()),
@@ -268,7 +276,9 @@ async fn register(
             message: "valid email and password of at least 8 characters required".into(),
         }));
     }
-    let password_hash = hash_password(input.password.clone()).await.map_err(map_auth)?;
+    let password_hash = hash_password(input.password.clone())
+        .await
+        .map_err(map_auth)?;
     let name = input
         .name
         .clone()
@@ -305,14 +315,14 @@ async fn login(
     Json(input): Json<Credentials>,
 ) -> Result<Response, Response> {
     enforce_rate_limit(&state, &headers, &input.email).await?;
-    let row: Option<(Uuid, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, email, name, password_hash FROM users WHERE email = $1",
-    )
-    .bind(input.email.to_lowercase())
-    .fetch_optional(&state.pool)
-    .await
-    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
-    let (id, email, name, password_hash) = row.ok_or_else(|| map_auth(AuthError::InvalidCredentials))?;
+    let row: Option<(Uuid, String, String, Option<String>)> =
+        sqlx::query_as("SELECT id, email, name, password_hash FROM users WHERE email = $1")
+            .bind(input.email.to_lowercase())
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let (id, email, name, password_hash) =
+        row.ok_or_else(|| map_auth(AuthError::InvalidCredentials))?;
     let stored = password_hash.ok_or_else(|| map_auth(AuthError::InvalidCredentials))?;
     let password_ok = verify_password(input.password.clone(), stored)
         .await
@@ -329,10 +339,7 @@ async fn login(
     finish_login_async(&state, &user, &headers).await
 }
 
-async fn logout(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Response, Response> {
+async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, Response> {
     let token = token_from_headers(&headers).ok_or_else(|| map_auth(AuthError::NoSession))?;
     let (_user, session_id) = user_from_token(&state.pool, &token)
         .await
@@ -342,8 +349,7 @@ async fn logout(
         .map_err(map_auth)?;
     let cookie = session_cookie("", 0, state.config.cookie_secure);
     let mut resp = (StatusCode::OK, Json(json!({"ok": true}))).into_response();
-    resp
-        .headers_mut()
+    resp.headers_mut()
         .insert("set-cookie", cookie.parse().expect("cookie header"));
     Ok(resp)
 }
@@ -356,13 +362,12 @@ struct MeResponse {
 
 async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Response, Response> {
     let user = current_user(&state, &headers).await?;
-    let rows = sqlx::query(
-        "SELECT company_id, role FROM businex.my_memberships($1) ORDER BY company_id",
-    )
-    .bind(user.id)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    let rows =
+        sqlx::query("SELECT company_id, role FROM businex.my_memberships($1) ORDER BY company_id")
+            .bind(user.id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(|_| error_response(&Error::Internal("database error".into())))?;
     let companies: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
@@ -497,14 +502,7 @@ async fn create_invitation(
     Json(input): Json<NewInvitation>,
 ) -> Result<Response, Response> {
     let user = current_user(&state, &headers).await?;
-    let auth = authorize(
-        &state,
-        &user,
-        company_id,
-        Permission::MembersManage,
-        "*",
-    )
-    .await?;
+    let auth = authorize(&state, &user, company_id, Permission::MembersManage, "*").await?;
     let role = Role::parse(&input.role).ok_or_else(|| {
         error_response(&Error::Invalid {
             message: "unknown role".into(),
@@ -555,8 +553,10 @@ async fn create_invitation(
     .await;
     // The raw token is returned once here; in production it is delivered by
     // email and never stored in plain text.
-    Ok(Json(json!({"id": id, "token": token, "expiresAt": Utc::now() + Duration::days(14)}))
-        .into_response())
+    Ok(
+        Json(json!({"id": id, "token": token, "expiresAt": Utc::now() + Duration::days(14)}))
+            .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -601,9 +601,8 @@ async fn accept_invitation(
             reason: "invitation issued to a different email".into(),
         }));
     }
-    let role = Role::parse(&role_str).ok_or_else(|| {
-        error_response(&Error::Internal("invitation has unknown role".into()))
-    })?;
+    let role = Role::parse(&role_str)
+        .ok_or_else(|| error_response(&Error::Internal("invitation has unknown role".into())))?;
 
     // Grant membership inside the company transaction so RLS confirms the
     // tenant, then mark the invitation used.
@@ -623,16 +622,14 @@ async fn accept_invitation(
             message: "already a member".into(),
         }));
     }
-    sqlx::query(
-        "INSERT INTO memberships (id, company_id, user_id, role) VALUES ($1, $2, $3, $4)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(company_id)
-    .bind(user.id)
-    .bind(role.as_str())
-    .execute(&mut *tx)
-    .await
-    .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    sqlx::query("INSERT INTO memberships (id, company_id, user_id, role) VALUES ($1, $2, $3, $4)")
+        .bind(Uuid::new_v4())
+        .bind(company_id)
+        .bind(user.id)
+        .bind(role.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
     tx.commit()
         .await
         .map_err(|_| error_response(&Error::Internal("database error".into())))?;
@@ -645,7 +642,6 @@ async fn accept_invitation(
 
     Ok(Json(json!({"companyId": company_id, "role": role.as_str()})).into_response())
 }
-
 
 // ---------------------------------------------------------------------------
 // Membership management: role changes and removal, escalation-proof.
@@ -831,12 +827,13 @@ async fn remove_member(
                 reason: "owner roles change only under the owner transfer policy".into(),
             }));
         }
-        let owners: (i64,) =
-            sqlx::query_as("SELECT count(*) FROM memberships WHERE company_id = $1 AND role = 'owner'")
-                .bind(company_id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+        let owners: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM memberships WHERE company_id = $1 AND role = 'owner'",
+        )
+        .bind(company_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
         if owners.0 <= 1 {
             return Err(error_response(&Error::Forbidden {
                 action: "members.remove".into(),

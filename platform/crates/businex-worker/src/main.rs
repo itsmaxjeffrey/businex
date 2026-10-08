@@ -26,7 +26,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             admin.close().await;
         }
         Err(_) => {
-            tracing::warn!("BUSINEX_DATABASE_ADMIN_URL not set; run businex-migrate before workers");
+            tracing::warn!(
+                "BUSINEX_DATABASE_ADMIN_URL not set; run businex-migrate before workers"
+            );
         }
     }
 
@@ -41,10 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     relay.start().await;
 
-    let worker = Worker::new(pool.clone(), relay.clone()).with_worker_id(format!(
-        "worker-{}",
-        &uuid::Uuid::new_v4().to_string()[..8]
-    ));
+    let worker = Worker::new(pool.clone(), relay.clone())
+        .with_worker_id(format!("worker-{}", &uuid::Uuid::new_v4().to_string()[..8]));
 
     // Handlers are registered by the platform as features land; until then
     // the worker still maintains schedules and reclaims expired leases.
@@ -62,8 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 fn businex_api_tracing() {
     use tracing_subscriber::EnvFilter;
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .json()

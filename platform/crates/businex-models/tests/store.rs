@@ -45,7 +45,10 @@ async fn concurrent_reservations_cannot_double_spend() {
         }
     }
     assert_eq!(wins, 1, "only one 600-token call fits in 1000 tokens");
-    let budget = store::get_budget(&db.pool, company).await.expect("get").expect("row");
+    let budget = store::get_budget(&db.pool, company)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(budget.reserved_tokens, 600);
     assert_eq!(budget.settled_tokens, 0);
 }
@@ -57,17 +60,30 @@ async fn totals_survive_process_restart() {
     store::set_budget(&db.pool, company, Some(10_000), None, None)
         .await
         .expect("budget");
-    let reservation = store::reserve(&db.pool, company, 500).await.expect("reserve");
-    store::settle(&db.pool, reservation, Some(Usage::of(300, 150)), Cost::Unknown)
+    let reservation = store::reserve(&db.pool, company, 500)
         .await
-        .expect("settle");
+        .expect("reserve");
+    store::settle(
+        &db.pool,
+        reservation,
+        Some(Usage::of(300, 150)),
+        Cost::Unknown,
+    )
+    .await
+    .expect("settle");
 
     // A fresh pool is what a restarted process sees: totals must persist.
     let restarted = businex_db::connect(&db.url(), 4).await.expect("reconnect");
-    let budget = store::get_budget(&restarted, company).await.expect("get").expect("row");
+    let budget = store::get_budget(&restarted, company)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(budget.settled_tokens, 450, "observed usage persisted");
     assert_eq!(budget.reserved_tokens, 0, "reservation closed");
-    assert_eq!(budget.unknown_cost_calls, 1, "unknown cost recorded as unknown");
+    assert_eq!(
+        budget.unknown_cost_calls, 1,
+        "unknown cost recorded as unknown"
+    );
 
     // And the cap still applies after restart.
     let denied = store::reserve(&restarted, company, 9_600).await;
@@ -82,12 +98,17 @@ async fn totals_survive_process_restart() {
 async fn unknown_usage_charges_estimate_and_unknown_cost_never_zeroes() {
     let db = TestDb::new().await;
     let company = setup_company(&db).await;
-    let reservation = store::reserve(&db.pool, company, 50).await.expect("reserve");
+    let reservation = store::reserve(&db.pool, company, 50)
+        .await
+        .expect("reserve");
     // Stream died with no usage and no cost: charge the estimate, mark unknown.
     store::settle(&db.pool, reservation, None, Cost::Unknown)
         .await
         .expect("settle");
-    let budget = store::get_budget(&db.pool, company).await.expect("get").expect("row");
+    let budget = store::get_budget(&db.pool, company)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(budget.settled_tokens, 50);
     assert_eq!(budget.settled_cost_micros, 0);
     assert_eq!(budget.unknown_cost_calls, 1);
@@ -100,7 +121,9 @@ async fn cost_budget_denies_when_exhausted() {
     store::set_budget(&db.pool, company, None, Some(5_000_000), Some(false))
         .await
         .expect("budget");
-    let reservation = store::reserve(&db.pool, company, 10).await.expect("reserve");
+    let reservation = store::reserve(&db.pool, company, 10)
+        .await
+        .expect("reserve");
     store::settle(
         &db.pool,
         reservation,
@@ -139,18 +162,29 @@ async fn release_returns_capacity() {
     store::set_budget(&db.pool, company, Some(100), None, None)
         .await
         .expect("budget");
-    let reservation = store::reserve(&db.pool, company, 100).await.expect("reserve");
-    store::release(&db.pool, reservation).await.expect("release");
-    let budget = store::get_budget(&db.pool, company).await.expect("get").expect("row");
+    let reservation = store::reserve(&db.pool, company, 100)
+        .await
+        .expect("reserve");
+    store::release(&db.pool, reservation)
+        .await
+        .expect("release");
+    let budget = store::get_budget(&db.pool, company)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(budget.reserved_tokens, 0);
-    store::reserve(&db.pool, company, 100).await.expect("capacity returned");
+    store::reserve(&db.pool, company, 100)
+        .await
+        .expect("capacity returned");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn settled_reservation_cannot_be_settled_or_released_twice() {
     let db = TestDb::new().await;
     let company = setup_company(&db).await;
-    let reservation = store::reserve(&db.pool, company, 10).await.expect("reserve");
+    let reservation = store::reserve(&db.pool, company, 10)
+        .await
+        .expect("reserve");
     store::settle(&db.pool, reservation, Some(Usage::of(4, 6)), Cost::Unknown)
         .await
         .expect("settle");
@@ -163,6 +197,9 @@ async fn settled_reservation_cannot_be_settled_or_released_twice() {
         store::release(&db.pool, reservation).await,
         Err(StoreError::ReservationClosed)
     ));
-    let budget = store::get_budget(&db.pool, company).await.expect("get").expect("row");
+    let budget = store::get_budget(&db.pool, company)
+        .await
+        .expect("get")
+        .expect("row");
     assert_eq!(budget.settled_tokens, 10, "usage counted exactly once");
 }

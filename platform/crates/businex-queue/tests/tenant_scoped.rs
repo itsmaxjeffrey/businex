@@ -49,9 +49,7 @@ async fn queue_cancellation_is_tenant_scoped() {
     let mut tx = begin_company_tx(&app, CompanyContext::new(company_a))
         .await
         .expect("tx");
-    let canceled = cancel_scoped(&mut tx, job_a.id)
-        .await
-        .expect("cancel own");
+    let canceled = cancel_scoped(&mut tx, job_a.id).await.expect("cancel own");
     assert_eq!(canceled.state, "canceled");
 
     // Company A cannot even see, let alone cancel, company B's job.

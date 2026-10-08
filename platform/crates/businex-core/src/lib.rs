@@ -214,9 +214,16 @@ impl<'de> Deserialize<'de> for Permission {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Actor {
-    User { id: uuid::Uuid },
-    Agent { id: uuid::Uuid },
-    GeneratedApp { app_id: uuid::Uuid, install_id: uuid::Uuid },
+    User {
+        id: uuid::Uuid,
+    },
+    Agent {
+        id: uuid::Uuid,
+    },
+    GeneratedApp {
+        app_id: uuid::Uuid,
+        install_id: uuid::Uuid,
+    },
     System,
 }
 
@@ -268,9 +275,9 @@ impl ResourceScope {
     pub fn allows(&self, action: Permission, resource: &str) -> bool {
         match self {
             ResourceScope::All => true,
-            ResourceScope::Actions { grants } => grants.iter().any(|g| {
-                g.permission == action && (g.resource == "*" || g.resource == resource)
-            }),
+            ResourceScope::Actions { grants } => grants
+                .iter()
+                .any(|g| g.permission == action && (g.resource == "*" || g.resource == resource)),
         }
     }
 }
@@ -429,7 +436,10 @@ mod tests {
             assert_eq!(Permission::parse(p.as_str()).expect("parse"), p);
             let json = serde_json::to_string(&p).expect("serialize");
             assert_eq!(json, format!("\"{}\"", p.as_str()));
-            assert_eq!(serde_json::from_str::<Permission>(&json).expect("deserialize"), p);
+            assert_eq!(
+                serde_json::from_str::<Permission>(&json).expect("deserialize"),
+                p
+            );
         }
     }
 
@@ -454,7 +464,9 @@ mod tests {
             Role::Admin,
             vec![],
         );
-        assert!(auth.check(Permission::RecordsRead, "app:inventory").is_err());
+        assert!(auth
+            .check(Permission::RecordsRead, "app:inventory")
+            .is_err());
         assert!(auth.check(Permission::RecordsRead, "*").is_err());
     }
 
@@ -463,21 +475,31 @@ mod tests {
         // The issuer is an owner, the credential gets one read grant: it must
         // not be able to write, update or delete anything.
         let auth = Authorization::granted(
-            Actor::GeneratedApp { app_id: Uuid::new_v4(), install_id: Uuid::new_v4() },
+            Actor::GeneratedApp {
+                app_id: Uuid::new_v4(),
+                install_id: Uuid::new_v4(),
+            },
             Uuid::new_v4(),
             Role::Owner,
             vec![ActionGrant::new(Permission::RecordsRead, "app:inventory")],
         );
         assert!(auth.check(Permission::RecordsRead, "app:inventory").is_ok());
-        assert!(auth.check(Permission::RecordsWrite, "app:inventory").is_err());
-        assert!(auth.check(Permission::RecordsDelete, "app:inventory").is_err());
+        assert!(auth
+            .check(Permission::RecordsWrite, "app:inventory")
+            .is_err());
+        assert!(auth
+            .check(Permission::RecordsDelete, "app:inventory")
+            .is_err());
         assert!(auth.check(Permission::RecordsRead, "app:other").is_err());
     }
 
     #[test]
     fn scoped_grants_narrow_role_and_resources() {
         let auth = Authorization::granted(
-            Actor::GeneratedApp { app_id: Uuid::new_v4(), install_id: Uuid::new_v4() },
+            Actor::GeneratedApp {
+                app_id: Uuid::new_v4(),
+                install_id: Uuid::new_v4(),
+            },
             Uuid::new_v4(),
             Role::Manager,
             vec![
@@ -485,11 +507,15 @@ mod tests {
                 ActionGrant::new(Permission::RecordsRead, "app:inventory"),
             ],
         );
-        assert!(auth.check(Permission::RecordsWrite, "app:inventory").is_ok());
+        assert!(auth
+            .check(Permission::RecordsWrite, "app:inventory")
+            .is_ok());
         assert!(auth.check(Permission::RecordsRead, "app:inventory").is_ok());
         assert!(auth.check(Permission::RecordsWrite, "app:other").is_err());
         // The role boundary still applies inside the scope.
-        assert!(auth.check(Permission::MembersManage, "app:inventory").is_err());
+        assert!(auth
+            .check(Permission::MembersManage, "app:inventory")
+            .is_err());
     }
 
     #[test]

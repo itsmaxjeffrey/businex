@@ -36,7 +36,10 @@ async fn role_attributes_match_documented_behavior() {
     assert_eq!(attrs.role, "businex_app");
     assert!(!attrs.superuser, "runtime role must not be superuser");
     assert!(!attrs.bypassrls, "runtime role must be subject to RLS");
-    assert!(!attrs.member_of_service, "runtime role must not join businex_service");
+    assert!(
+        !attrs.member_of_service,
+        "runtime role must not join businex_service"
+    );
     ensure_api_role_safe(&attrs).expect("api role policy");
 
     // Service role: workers span tenants by design, but never superuser.
@@ -44,7 +47,10 @@ async fn role_attributes_match_documented_behavior() {
     let sattrs = current_role_attributes(&service).await.expect("attrs");
     assert_eq!(sattrs.role, "businex_service");
     assert!(!sattrs.superuser, "service role must not be superuser");
-    assert!(sattrs.bypassrls, "service role must bypass RLS as documented");
+    assert!(
+        sattrs.bypassrls,
+        "service role must bypass RLS as documented"
+    );
     ensure_worker_role_safe(&sattrs).expect("worker role policy");
 
     // The catalog must show exactly these attributes (fail closed claim).
@@ -65,10 +71,16 @@ async fn role_attributes_match_documented_behavior() {
     // Policy checks fail closed on violations.
     let mut bad = sattrs.clone();
     bad.superuser = true;
-    assert!(ensure_worker_role_safe(&bad).is_err(), "superuser worker must be refused");
+    assert!(
+        ensure_worker_role_safe(&bad).is_err(),
+        "superuser worker must be refused"
+    );
     let mut bad_api = attrs.clone();
     bad_api.bypassrls = true;
-    assert!(ensure_api_role_safe(&bad_api).is_err(), "BYPASSRLS api role must be refused");
+    assert!(
+        ensure_api_role_safe(&bad_api).is_err(),
+        "BYPASSRLS api role must be refused"
+    );
     let mut bad_member = attrs.clone();
     bad_member.member_of_service = true;
     assert!(
@@ -127,7 +139,10 @@ async fn tenant_isolation_for_read_insert_update_delete() {
     .bind(company_b)
     .execute(&mut *tx_f)
     .await;
-    assert!(foreign.is_err(), "inserting another tenant's row must be rejected");
+    assert!(
+        foreign.is_err(),
+        "inserting another tenant's row must be rejected"
+    );
     tx_f.rollback().await.expect("rollback rejected insert");
 
     // Insert own row works.
@@ -165,13 +180,21 @@ async fn tenant_isolation_for_read_insert_update_delete() {
         .execute(&mut *tx)
         .await
         .expect("update runs");
-    assert_eq!(updated.rows_affected(), 0, "foreign update must match no rows");
+    assert_eq!(
+        updated.rows_affected(),
+        0,
+        "foreign update must match no rows"
+    );
     let deleted = sqlx::query("DELETE FROM audit_log WHERE id = $1")
         .bind(audit_b)
         .execute(&mut *tx)
         .await
         .expect("delete runs");
-    assert_eq!(deleted.rows_affected(), 0, "foreign delete must match no rows");
+    assert_eq!(
+        deleted.rows_affected(),
+        0,
+        "foreign delete must match no rows"
+    );
 
     // Own rows are writable.
     let own = sqlx::query("UPDATE audit_log SET action = 'updated' WHERE id = $1")
@@ -212,7 +235,11 @@ async fn tenant_isolation_for_read_insert_update_delete() {
         .fetch_one(&mut *tx)
         .await
         .expect("count");
-    assert_eq!(n.get::<i64, _>("n"), 0, "no context must deny all tenant rows");
+    assert_eq!(
+        n.get::<i64, _>("n"),
+        0,
+        "no context must deny all tenant rows"
+    );
     tx.rollback().await.expect("rollback");
 }
 
@@ -230,5 +257,9 @@ async fn service_role_processes_all_tenants() {
         .fetch_one(&service)
         .await
         .expect("service read");
-    assert_eq!(n.get::<i64, _>("n"), 2, "service role spans tenants by design");
+    assert_eq!(
+        n.get::<i64, _>("n"),
+        2,
+        "service role spans tenants by design"
+    );
 }

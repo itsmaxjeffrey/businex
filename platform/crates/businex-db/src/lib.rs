@@ -116,7 +116,9 @@ pub async fn begin_company_tx_on<'c>(
 
 /// Begin a service transaction as the service role (bypasses RLS). Used by
 /// workers that process jobs for any company and by migration tooling.
-pub async fn begin_service_tx<'a>(pool: &'a PgPool) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
+pub async fn begin_service_tx<'a>(
+    pool: &'a PgPool,
+) -> Result<Transaction<'a, Postgres>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL ROLE {}", SERVICE_ROLE))
         .execute(&mut *tx)
@@ -127,9 +129,8 @@ pub async fn begin_service_tx<'a>(pool: &'a PgPool) -> Result<Transaction<'a, Po
 /// Role attribute verification (fail closed) and disposable test databases.
 pub mod verify_roles;
 pub use verify_roles::{
-    current_role_attributes, ensure_api_role_safe, ensure_worker_role_safe,
-    provision_test_roles, role_url, RoleAttributes, TestDb, TEST_APP_PASSWORD,
-    TEST_SERVICE_PASSWORD,
+    current_role_attributes, ensure_api_role_safe, ensure_worker_role_safe, provision_test_roles,
+    role_url, RoleAttributes, TestDb, TEST_APP_PASSWORD, TEST_SERVICE_PASSWORD,
 };
 
 /// Readiness probe: a real round trip to the database.

@@ -108,7 +108,9 @@ impl Price {
             return Err(ModelError::Config("currency must be ISO 4217".into()));
         }
         if self.effective_date.len() != 10 {
-            return Err(ModelError::Config("effective_date must be YYYY-MM-DD".into()));
+            return Err(ModelError::Config(
+                "effective_date must be YYYY-MM-DD".into(),
+            ));
         }
         Ok(())
     }
@@ -159,7 +161,9 @@ pub struct ModelResponse {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum StreamEvent {
-    Delta { text: String },
+    Delta {
+        text: String,
+    },
     /// Terminal event. usage is None when the stream carried no usage record;
     /// callers must then treat the request as unaccounted, not free.
     Completed {
