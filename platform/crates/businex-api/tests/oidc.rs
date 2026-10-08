@@ -153,9 +153,7 @@ async fn token(State(st): State<MockState>, Form(form): Form<HashMap<String, Str
 /// Start the mock provider on a random loopback port.
 fn mock_provider() -> (String, Arc<Mutex<MockSpec>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    listener
-        .set_nonblocking(true)
-        .expect("mock listener nonblocking");
+    listener.set_nonblocking(true).expect("nonblocking mock");
     let addr = listener.local_addr().expect("mock addr");
     let base = format!("http://127.0.0.1:{}", addr.port());
     let spec = Arc::new(Mutex::new(MockSpec::new()));
@@ -176,36 +174,51 @@ fn mock_provider() -> (String, Arc<Mutex<MockSpec>>) {
 }
 
 /// Minimal cookie-aware oneshot client (one browser = one instance).
+/// A name-keyed jar ingests every Set-Cookie value and sends the whole jar,
+/// so one response can never silently discard another's session or binding
+/// cookie.
 struct Client {
     app: Router,
-    cookie: Option<String>,
+    jar: HashMap<String, String>,
 }
 
 impl Client {
     fn new(app: Router) -> Self {
-        Client { app, cookie: None }
+        Client {
+            app,
+            jar: HashMap::new(),
+        }
     }
 
-    async fn call(&mut self, uri: &str) -> (StatusCode, Value, Option<String>) {
+    async fn call(&mut self, uri: &str) -> (StatusCode, Value, Vec<String>) {
         let mut builder = Request::builder()
             .method("GET")
             .uri(uri)
             .header("content-type", "application/json");
-        if let Some(cookie) = &self.cookie {
-            builder = builder.header("cookie", cookie.clone());
+        if !self.jar.is_empty() {
+            let cookie = self
+                .jar
+                .iter()
+                .map(|(name, value)| format!("{}={}", name, value))
+                .collect::<Vec<_>>()
+                .join("; ");
+            builder = builder.header("cookie", cookie);
         }
         let req = builder.body(Body::empty()).expect("request");
         let resp = self.app.clone().oneshot(req).await.expect("response");
         let status = resp.status();
-        let set_cookie = resp
+        let set_cookies: Vec<String> = resp
             .headers()
-            .get("set-cookie")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string());
-        if let Some(sc) = &set_cookie {
-            let pair = sc.split(";").next().unwrap_or("").to_string();
-            if pair.contains('=') {
-                self.cookie = Some(pair);
+            .get_all("set-cookie")
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .collect();
+        for sc in &set_cookies {
+            if let Some(pair) = sc.split(';').next() {
+                if let Some((name, value)) = pair.split_once('=') {
+                    self.jar.insert(name.trim().to_string(), value.to_string());
+                }
             }
         }
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -216,11 +229,14 @@ impl Client {
         } else {
             serde_json::from_slice(&bytes).unwrap_or(Value::Null)
         };
-        (status, value, set_cookie)
+        (status, value, set_cookies)
     }
 
-    fn set_cookie(&mut self, value: String) {
-        self.cookie = Some(value);
+    /// Force a cookie into the jar, as if the browser already held one.
+    fn set_cookie(&mut self, pair: &str) {
+        if let Some((name, value)) = pair.split_once('=') {
+            self.jar.insert(name.trim().to_string(), value.to_string());
+        }
     }
 }
 
@@ -297,9 +313,10 @@ async fn valid_login_creates_verified_user_and_session() {
         .as_str()
         .expect("auth url")
         .to_string();
-    assert!(binding
-        .expect("binding cookie")
-        .contains("businex_oidc_bind"));
+    assert!(
+        binding.iter().any(|sc| sc.contains("businex_oidc_bind")),
+        "start response must set the browser binding cookie"
+    );
     assert!(auth_url.contains("code_challenge"));
     assert!(auth_url.contains("scope=openid"));
     let state = query_param(&auth_url, "state");
@@ -312,7 +329,10 @@ async fn valid_login_creates_verified_user_and_session() {
     }
 
     let (status, body, _sc) = client
-        .call(&format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state))
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["user"]["email"], json!("user42@example.test"));
@@ -346,7 +366,10 @@ async fn stolen_flow_is_rejected_in_another_browser_and_not_consumed() {
     let mut attacker = Client::new(app.clone());
     let (state, nonce, _challenge) = start_flow(&mut attacker).await;
     spec.lock().unwrap().nonce = nonce;
-    let uri = format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state);
+    let uri = format!(
+        "/api/auth/oidc/callback?code=test-auth-code&state={}",
+        state
+    );
 
     // Victim with no binding cookie at all.
     let mut victim = Client::new(app.clone());
@@ -355,7 +378,7 @@ async fn stolen_flow_is_rejected_in_another_browser_and_not_consumed() {
 
     // Victim presenting a different binding cookie.
     let mut victim2 = Client::new(app.clone());
-    victim2.set_cookie("businex_oidc_bind=deadbeef".to_string());
+    victim2.set_cookie("businex_oidc_bind=deadbeef");
     let (status, _body, _sc) = victim2.call(&uri).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 
@@ -379,7 +402,10 @@ async fn replayed_state_is_refused() {
     let mut client = Client::new(app);
     let (state, nonce, _challenge) = start_flow(&mut client).await;
     spec.lock().unwrap().nonce = nonce;
-    let uri = format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state);
+    let uri = format!(
+        "/api/auth/oidc/callback?code=test-auth-code&state={}",
+        state
+    );
     let (status, _body, _sc) = client.call(&uri).await;
     assert_eq!(status, StatusCode::OK);
     let (status, _body, _sc) = client.call(&uri).await;
@@ -401,7 +427,10 @@ where
         edit(&mut s);
     }
     let (status, _body, _sc) = client
-        .call(&format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state))
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
         .await;
     status
 }
@@ -462,7 +491,10 @@ async fn expired_flow_state_is_rejected() {
     .await
     .expect("expire flow");
     let (status, _body, _sc) = client
-        .call(&format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state))
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
         .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
@@ -484,7 +516,10 @@ async fn hostile_return_to_falls_back_to_root() {
     let state = query_param(&auth_url, "state");
     spec.lock().unwrap().nonce = query_param(&auth_url, "nonce");
     let (status, body, _sc) = client
-        .call(&format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state))
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["return_to"], json!("/"));
@@ -513,7 +548,10 @@ async fn same_subject_under_two_issuers_never_shares_an_account() {
             s.subject = "stable-subject".to_string();
         }
         let (status, body, _sc) = client
-            .call(&format!("/api/auth/oidc/callback?code=test-auth-code&state={}", state))
+            .call(&format!(
+                "/api/auth/oidc/callback?code=test-auth-code&state={}",
+                state
+            ))
             .await;
         assert_eq!(status, StatusCode::OK);
         users.push(body["user"]["id"].as_str().expect("user id").to_string());
@@ -525,6 +563,93 @@ async fn same_subject_under_two_issuers_never_shares_an_account() {
         .await
         .expect("identity count");
     assert_eq!(count.0, 2, "composite mapping rows missing");
+}
+
+#[tokio::test]
+async fn same_email_across_issuers_conflicts_without_linking() {
+    let db = TestDb::new().await;
+    let (issuer_a, spec_a) = mock_provider();
+    let (issuer_b, spec_b) = mock_provider();
+    let app_a = app_for(&db, &issuer_a).await;
+    let app_b = app_for(&db, &issuer_b).await;
+    let mut client_a = Client::new(app_a);
+    let mut client_b = Client::new(app_b);
+
+    // Both providers assert the same subject AND the same verified e-mail.
+    {
+        let mut s = spec_a.lock().unwrap();
+        s.subject = "stable-subject".to_string();
+        s.email = "shared@example.test".to_string();
+    }
+    {
+        let mut s = spec_b.lock().unwrap();
+        s.subject = "stable-subject".to_string();
+        s.email = "shared@example.test".to_string();
+    }
+
+    let (state, nonce, _challenge) = start_flow(&mut client_a).await;
+    spec_a.lock().unwrap().nonce = nonce;
+    let (status, body, _sc) = client_a
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_user = body["user"]["id"].as_str().expect("user id").to_string();
+
+    // A second issuer presenting the same verified e-mail must never
+    // auto-link to the account that already holds it: the callback reports
+    // a conflict, issues no session and writes no identity row.
+    let (state, nonce, _challenge) = start_flow(&mut client_b).await;
+    spec_b.lock().unwrap().nonce = nonce;
+    let (status, body, _sc) = client_b
+        .call(&format!(
+            "/api/auth/oidc/callback?code=test-auth-code&state={}",
+            state
+        ))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "cross-issuer e-mail collision was not refused: {}",
+        body
+    );
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists"),
+        "unexpected body: {}",
+        body
+    );
+
+    let (status, _me, _sc) = client_b.call("/api/auth/me").await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "conflicting login was given a session"
+    );
+
+    let linked: (i64,) = sqlx::query_as("SELECT count(*) FROM oidc_identities WHERE issuer = $1")
+        .bind(issuer_b.trim_end_matches('/'))
+        .fetch_one(&db.pool)
+        .await
+        .expect("identity count");
+    assert_eq!(linked.0, 0, "second issuer linked to the existing account");
+
+    let users: (i64,) = sqlx::query_as("SELECT count(*) FROM users WHERE email = $1")
+        .bind("shared@example.test")
+        .fetch_one(&db.pool)
+        .await
+        .expect("user count");
+    assert_eq!(users.0, 1, "duplicate account created for one e-mail");
+
+    let owner: (String,) =
+        sqlx::query_as("SELECT user_id::text FROM oidc_identities WHERE issuer = $1")
+            .bind(issuer_a.trim_end_matches('/'))
+            .fetch_one(&db.pool)
+            .await
+            .expect("first identity row");
+    assert_eq!(owner.0, first_user);
 }
 
 #[tokio::test]
