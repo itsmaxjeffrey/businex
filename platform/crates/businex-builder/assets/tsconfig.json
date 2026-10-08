@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "Bundler",
+    "lib": ["ES2022"],
+    "types": [],
+    "strict": true,
+    "noEmitOnError": true,
+    "skipLibCheck": true,
+    "outDir": "/workspace/out/dist"
+  },
+  "include": ["/workspace/src/**/*.ts", "/workspace/assets/sdk.d.ts"]
+}
