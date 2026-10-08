@@ -11,14 +11,15 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-31). Backend tally: 148 passing, 0 failed
+Last updated: 2026-10-08 (runs 1-39). Backend tally: 148 passing, 0 failed
 (businex-api 53 green in run 31 after the key-refresh narrowing; the other
 crates are unchanged since the 145-green run-27 workspace sweep,
 log /tmp/businex-workspace-run27.log). Web tally (run 28): 25 Vitest
 passing, 0 failed (ui library 15 + desktop 10); tsc typecheck green; vite
-build green. E2E (run 29): Playwright smoke 1/1 green (register, company
-create, invite, sign out, sign in) against a disposable DB + local API +
-the production bundle; document-load numbers recorded below.
+build green. E2E (run 39): Playwright 4/4 green — smoke and two-user team
+journeys on desktop and mobile projects — against a disposable DB + local
+API + the production bundle; local-lab document-load numbers recorded
+below (harness timings, never presented as real-user LCP/INP).
 api 50 (unit 14, routes 5, identity 14, oidc 15, rate limit 2), core 13,
 rls 4, events 7 (unit 2 + relay 5), queue 17 (unit 6 + queue 10 +
 tenant 1), worker 9, models 45 (types/pricing 27 unit, adapter contracts 11,
@@ -143,13 +144,16 @@ NO_PROXY=127.0.0.1,localhost scoped to the test subprocess only.
 | ID | Item | Status | Evidence |
 | --- | --- | --- | --- |
 | E1 | Playwright runs every spec once per project: a wide desktop and a Pixel-7-class phone, both driving the production bundle and the real Rust API | tested | platform/web/playwright.config.ts with shared profiles in e2e/devices.ts; run-37: 4/4 green (34.8s) — smoke and team journeys on each project |
-| E2 | Real two-user team journey in the browser: invite issuance with the single-use token surfaced exactly once, acceptance by the invited account, token reuse refused, role change to viewer, viewer self-elevation denied by the API, removal with immediate access loss | tested | e2e/team.spec.ts, 13.2s on desktop and 13.2s on mobile |
+| E2 | Real two-user team journey in the browser: invite issuance, acceptance by the invited account, token reuse refused, role change to viewer, viewer self-elevation and viewer self-removal denied by the API, removal with immediate access loss | tested | e2e/team.spec.ts (15.1s desktop, 13.3s mobile, run 39). The "token surfaced exactly once" claim is now assertion-backed, not assumed: e2e/smoke.spec.ts captures the token from the dialog and asserts it is absent after dismissal plus form reopen and after a full page reload |
 | E3 | Invitation replay defect found by the first browser run and fixed | fixed | accepted_at was written after the company transaction committed and without tenant context, so the app role RLS dropped it silently and a spent token stayed replayable. It is now marked inside the transaction with a guarded accepted_at IS NULL update — also atomic under concurrent accepts. The e2e token-reuse step is the regression guard; identity suite re-run 14/14 |
 | E4 | Mobile overlay defect found and fixed | fixed | the fixed success-toast stack covered the Accept control on the narrow layout. Success toasts now auto-clear after 4s while error toasts stay until dismissed (apps/desktop/src/toasts.ts); the journey waits for the clearance so it never masks a control |
+| E5 | Perf measurement honesty: a missing measurement is never reported as fast | tested | measure() waits for loadEventEnd > 0 before reading any timing and reports FCP as the string unavailable instead of 0 when it has not fired; assertions require dclMs and loadMs > 0 before the 5s budget check (run 39) |
+| E6 | Harness integrity: run-e2e.sh builds the Rust binary from current sources before launching the API | tested | the harness runs cargo build -p businex-api first and refuses to proceed if it fails; run 39 log line "e2e: api built from current sources" — stale target/debug binaries can no longer be exercised silently |
+| E7 | Keyboard dialogs, mobile width, second-user acceptance, persistence and role-denial paths | tested | Enter opens the invite dialog and Escape dismisses it (smoke.spec.ts); every spec also runs at Pixel-7 phone width (E1); the team journey covers invite acceptance by the second user, membership rows and the signed-in session surviving reload, and role denial beyond self-elevation — a viewer cannot remove their own row and it persists |
 
-Per-document-load numbers recorded inside the browser runs (run 37): desktop cold-register load 86ms / DCL 80ms / FCP 220ms, warm-home load 37ms / DCL 32ms; mobile cold-register load 64ms / DCL 63ms / FCP 184ms, warm-home load 32ms / DCL 31ms.
+Per-document-load numbers recorded inside the browser runs (run 39): desktop cold-register load 89ms / DCL 84ms / FCP 252ms, warm-home load 56ms / DCL 45ms / FCP 128ms; mobile cold-register load 88ms / DCL 83ms / FCP 204ms, warm-home load 38ms / DCL 37ms / FCP 92ms. These are synthetic local-lab document-load timings measured by the harness against vite preview on loopback — not real-user metrics such as LCP or INP, and never to be quoted as such.
 
-Run evidence: /tmp/businex-e2e-run.log (4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
+Run evidence: /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
 
 ## Known gates and limitations
 
