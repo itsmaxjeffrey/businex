@@ -65,7 +65,10 @@ async fn totals_survive_process_restart() {
         .expect("reserve");
     store::settle(
         &db.pool,
+        company,
         reservation,
+        "test",
+        "test-model",
         Some(Usage::of(300, 150)),
         Cost::Unknown,
     )
@@ -102,7 +105,7 @@ async fn unknown_usage_charges_estimate_and_unknown_cost_never_zeroes() {
         .await
         .expect("reserve");
     // Stream died with no usage and no cost: charge the estimate, mark unknown.
-    store::settle(&db.pool, reservation, None, Cost::Unknown)
+    store::settle(&db.pool, company, reservation, "test", "test-model", None, Cost::Unknown)
         .await
         .expect("settle");
     let budget = store::get_budget(&db.pool, company)
@@ -126,7 +129,10 @@ async fn cost_budget_denies_when_exhausted() {
         .expect("reserve");
     store::settle(
         &db.pool,
+        company,
         reservation,
+        "test",
+        "test-model",
         Some(Usage::of(5, 5)),
         Cost::Known { micros: 5_000_000 },
     )
@@ -165,7 +171,7 @@ async fn release_returns_capacity() {
     let reservation = store::reserve(&db.pool, company, 100)
         .await
         .expect("reserve");
-    store::release(&db.pool, reservation)
+    store::release(&db.pool, company, reservation)
         .await
         .expect("release");
     let budget = store::get_budget(&db.pool, company)
@@ -185,16 +191,33 @@ async fn settled_reservation_cannot_be_settled_or_released_twice() {
     let reservation = store::reserve(&db.pool, company, 10)
         .await
         .expect("reserve");
-    store::settle(&db.pool, reservation, Some(Usage::of(4, 6)), Cost::Unknown)
-        .await
-        .expect("settle");
+    store::settle(
+        &db.pool,
+        company,
+        reservation,
+        "test",
+        "test-model",
+        Some(Usage::of(4, 6)),
+        Cost::Unknown,
+    )
+    .await
+    .expect("settle");
     // The same reservation id cannot be replayed.
     assert!(matches!(
-        store::settle(&db.pool, reservation, Some(Usage::of(1, 1)), Cost::Unknown).await,
+        store::settle(
+            &db.pool,
+            company,
+            reservation,
+            "test",
+            "test-model",
+            Some(Usage::of(1, 1)),
+            Cost::Unknown,
+        )
+        .await,
         Err(StoreError::ReservationClosed)
     ));
     assert!(matches!(
-        store::release(&db.pool, reservation).await,
+        store::release(&db.pool, company, reservation).await,
         Err(StoreError::ReservationClosed)
     ));
     let budget = store::get_budget(&db.pool, company)
@@ -202,4 +225,112 @@ async fn settled_reservation_cannot_be_settled_or_released_twice() {
         .expect("get")
         .expect("row");
     assert_eq!(budget.settled_tokens, 10, "usage counted exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn settle_and_release_refuse_another_companys_reservation() {
+    let db = TestDb::new().await;
+    let company_a = setup_company(&db).await;
+    let company_b = setup_company(&db).await;
+    let reservation = store::reserve(&db.pool, company_a, 10)
+        .await
+        .expect("reserve");
+
+    // Company B may learn the reservation id but can do nothing with it.
+    assert!(matches!(
+        store::settle(
+            &db.pool,
+            company_b,
+            reservation,
+            "test",
+            "test-model",
+            Some(Usage::of(1, 1)),
+            Cost::Unknown,
+        )
+        .await,
+        Err(StoreError::ReservationClosed)
+    ));
+    assert!(matches!(
+        store::release(&db.pool, company_b, reservation).await,
+        Err(StoreError::ReservationClosed)
+    ));
+
+    // The rightful owner still settles it exactly once.
+    store::settle(
+        &db.pool,
+        company_a,
+        reservation,
+        "test",
+        "test-model",
+        Some(Usage::of(4, 6)),
+        Cost::Unknown,
+    )
+    .await
+    .expect("owner settle");
+    let budget = store::get_budget(&db.pool, company_a)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(budget.settled_tokens, 10);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn store_works_under_the_application_role_with_tenant_pin() {
+    let db = TestDb::new().await;
+    let company_a = setup_company(&db).await;
+    let company_b = setup_company(&db).await;
+    store::set_budget(&db.pool, company_b, Some(7), None, None)
+        .await
+        .expect("budget b");
+
+    // Production connects as businex_app and the model tables are FORCE ROW
+    // LEVEL SECURITY. The old store ran bare transactions with no tenant
+    // pin: every statement saw no rows and failed. The pin each store
+    // transaction sets is what makes the accounting usable at all here.
+    let app = db
+        .role_pool(businex_db::APP_ROLE, businex_db::TEST_APP_PASSWORD)
+        .await;
+    store::set_budget(&app, company_a, Some(1000), None, None)
+        .await
+        .expect("budget via app role");
+    let reservation = store::reserve(&app, company_a, 400)
+        .await
+        .expect("reserve via app role");
+    store::settle(
+        &app,
+        company_a,
+        reservation,
+        "test",
+        "test-model",
+        Some(Usage::of(300, 100)),
+        Cost::Unknown,
+    )
+    .await
+    .expect("settle via app role");
+    let budget = store::get_budget(&app, company_a)
+        .await
+        .expect("get via app role")
+        .expect("row");
+    assert_eq!(budget.settled_tokens, 400);
+
+    // A pinned transaction sees exactly one tenant's rows, never both.
+    let mut tx = app.begin().await.expect("tx");
+    sqlx::query("SELECT set_config('businex.company_id', $1, true)")
+        .bind(company_a.to_string())
+        .execute(&mut *tx)
+        .await
+        .expect("pin");
+    let count: (i64,) = sqlx::query_as("SELECT count(*) FROM model_budgets")
+        .fetch_one(&mut *tx)
+        .await
+        .expect("count");
+    assert_eq!(count.0, 1, "pinned transaction sees exactly one budget row");
+    tx.rollback().await.expect("rollback");
+
+    // And with no pin at all the same connection sees nothing.
+    let bare: (i64,) = sqlx::query_as("SELECT count(*) FROM model_budgets")
+        .fetch_one(&app)
+        .await
+        .expect("bare count");
+    assert_eq!(bare.0, 0, "unpinned app-role query leaks nothing");
 }

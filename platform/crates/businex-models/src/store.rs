@@ -10,10 +10,16 @@
 //! queue on the lock and re-read totals, so they cannot both pass the same
 //! remaining balance. A company with no explicit policy gets an unlimited
 //! default row instead of a spurious denial.
+//!
+//! Tenancy: every transaction pins businex.company_id before touching the
+//! model tables. They are FORCE ROW LEVEL SECURITY, so the application role
+//! sees exactly one company's rows; without the pin the statements fail closed
+//! with no rows at all. Callers pass the company id they were authorized for,
+//! and settle/release refuse reservations that belong to another company.
 
 use crate::types::{Cost, Usage};
 use serde::{Deserialize, Serialize};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +51,20 @@ pub struct BudgetRow {
     pub unknown_cost_calls: i64,
 }
 
+/// Pin the tenant context inside a store transaction. The setting is
+/// transaction-local, so it cannot leak into the next transaction on the same
+/// connection.
+async fn pin_company(
+    tx: &mut Transaction<'_, Postgres>,
+    company_id: Uuid,
+) -> Result<(), StoreError> {
+    sqlx::query("SELECT set_config('businex.company_id', $1, true)")
+        .bind(company_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 /// Create or update a company budget policy. Omitted fields stay unchanged.
 pub async fn set_budget(
     pool: &PgPool,
@@ -53,6 +73,8 @@ pub async fn set_budget(
     max_cost_micros: Option<i64>,
     deny_when_cost_unknown: Option<bool>,
 ) -> Result<BudgetRow, StoreError> {
+    let mut tx = pool.begin().await?;
+    pin_company(&mut tx, company_id).await?;
     let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, i64, i64, i64, i64)>(
         r#"
         INSERT INTO model_budgets (company_id, max_tokens_per_period, max_cost_micros, deny_when_cost_unknown)
@@ -70,8 +92,9 @@ pub async fn set_budget(
     .bind(max_tokens_per_period)
     .bind(max_cost_micros)
     .bind(deny_when_cost_unknown)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(BudgetRow {
         max_tokens_per_period: row.0,
         max_cost_micros: row.1,
@@ -91,6 +114,7 @@ pub async fn reserve(
     estimate_tokens: i64,
 ) -> Result<Uuid, StoreError> {
     let mut tx = pool.begin().await?;
+    pin_company(&mut tx, company_id).await?;
     sqlx::query(
         "INSERT INTO model_budgets (company_id) VALUES ($1)
          ON CONFLICT (company_id) DO NOTHING",
@@ -154,25 +178,34 @@ pub async fn reserve(
 
 /// Settle a reservation with observed usage and cost. Unknown usage charges
 /// the reservation estimate; unknown cost increments the unknown counter and
-/// never the cost total.
+/// never the cost total. The provider and model are recorded so usage rows
+/// attribute spend to the call that produced it.
+///
+/// The company scoping is deliberate: a reservation belonging to another
+/// company cannot be settled here even if its id is known.
+#[allow(clippy::too_many_arguments)]
 pub async fn settle(
     pool: &PgPool,
+    company_id: Uuid,
     reservation_id: Uuid,
+    provider: &str,
+    model: &str,
     usage: Option<Usage>,
     cost: Cost,
 ) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
-    let row: (Uuid, i64) = sqlx::query_as(
+    pin_company(&mut tx, company_id).await?;
+    let row: Option<(i64,)> = sqlx::query_as(
         r#"UPDATE model_reservations
            SET state = 'settled', settled_at = now()
-           WHERE id = $1 AND state = 'open'
-           RETURNING company_id, tokens"#,
+           WHERE id = $1 AND company_id = $2 AND state = 'open'
+           RETURNING tokens"#,
     )
     .bind(reservation_id)
+    .bind(company_id)
     .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(StoreError::ReservationClosed)?;
-    let (company_id, reserved) = row;
+    .await?;
+    let (reserved,) = row.ok_or(StoreError::ReservationClosed)?;
     let observed = usage.and_then(|u| u.total()).map(|t| t as i64);
     let tokens = observed.unwrap_or(reserved);
     let (cost_micros, cost_known) = match cost {
@@ -202,8 +235,8 @@ pub async fn settle(
     )
     .bind(Uuid::new_v4())
     .bind(company_id)
-    .bind("unknown")
-    .bind("unknown")
+    .bind(provider)
+    .bind(model)
     .bind(usage.and_then(|u| u.input_tokens).map(|t| t as i64))
     .bind(usage.and_then(|u| u.output_tokens).map(|t| t as i64))
     .bind(cost_micros)
@@ -216,24 +249,31 @@ pub async fn settle(
 }
 
 /// Release a reservation without accounting (call failed before usage).
-pub async fn release(pool: &PgPool, reservation_id: Uuid) -> Result<(), StoreError> {
+/// Company scoped like settle.
+pub async fn release(
+    pool: &PgPool,
+    company_id: Uuid,
+    reservation_id: Uuid,
+) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
-    let row: (Uuid, i64) = sqlx::query_as(
+    pin_company(&mut tx, company_id).await?;
+    let row: Option<(i64,)> = sqlx::query_as(
         r#"UPDATE model_reservations
            SET state = 'released', settled_at = now()
-           WHERE id = $1 AND state = 'open'
-           RETURNING company_id, tokens"#,
+           WHERE id = $1 AND company_id = $2 AND state = 'open'
+           RETURNING tokens"#,
     )
     .bind(reservation_id)
+    .bind(company_id)
     .fetch_optional(&mut *tx)
-    .await?
-    .ok_or(StoreError::ReservationClosed)?;
+    .await?;
+    let (tokens,) = row.ok_or(StoreError::ReservationClosed)?;
     sqlx::query(
         "UPDATE model_budgets SET reserved_tokens = GREATEST(reserved_tokens - $2, 0), updated_at = now()
          WHERE company_id = $1",
     )
-    .bind(row.0)
-    .bind(row.1)
+    .bind(company_id)
+    .bind(tokens)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -241,14 +281,17 @@ pub async fn release(pool: &PgPool, reservation_id: Uuid) -> Result<(), StoreErr
 }
 
 pub async fn get_budget(pool: &PgPool, company_id: Uuid) -> Result<Option<BudgetRow>, StoreError> {
+    let mut tx = pool.begin().await?;
+    pin_company(&mut tx, company_id).await?;
     let row = sqlx::query_as::<_, (Option<i64>, Option<i64>, bool, i64, i64, i64, i64)>(
         r#"SELECT max_tokens_per_period, max_cost_micros, deny_when_cost_unknown,
                   reserved_tokens, settled_tokens, settled_cost_micros, unknown_cost_calls
            FROM model_budgets WHERE company_id = $1"#,
     )
     .bind(company_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row.map(|r| BudgetRow {
         max_tokens_per_period: r.0,
         max_cost_micros: r.1,
