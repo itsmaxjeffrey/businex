@@ -613,6 +613,26 @@ async fn accept_invitation(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(|_| error_response(&Error::Internal("database error".into())))?;
+    // Mark the invitation used first, inside the company transaction. Two
+    // reasons this must not happen after commit: the application role only
+    // reaches invitation rows through the tenant context, so a later update
+    // without that context is silently dropped by row level security and
+    // leaves the spent token replayable; and the guarded update makes the
+    // single-use grant atomic under concurrent accepts — the loser sees zero
+    // marked rows and rolls back before ever inserting a membership.
+    let marked = sqlx::query(
+        "UPDATE invitations SET accepted_at = now() WHERE id = $1 AND accepted_at IS NULL",
+    )
+    .bind(invite_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(|_| error_response(&Error::Internal("database error".into())))?
+    .rows_affected();
+    if marked == 0 {
+        return Err(error_response(&Error::Conflict {
+            message: "invitation already used".into(),
+        }));
+    }
     let existing: Option<(Uuid,)> =
         sqlx::query_as("SELECT id FROM memberships WHERE company_id = $1 AND user_id = $2")
             .bind(company_id)
@@ -634,12 +654,6 @@ async fn accept_invitation(
         .await
         .map_err(|_| error_response(&Error::Internal("database error".into())))?;
     tx.commit()
-        .await
-        .map_err(|_| error_response(&Error::Internal("database error".into())))?;
-
-    sqlx::query("UPDATE invitations SET accepted_at = now() WHERE id = $1")
-        .bind(invite_id)
-        .execute(&state.pool)
         .await
         .map_err(|_| error_response(&Error::Internal("database error".into())))?;
 
