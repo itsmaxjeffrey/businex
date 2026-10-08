@@ -26,7 +26,9 @@ pub struct GenerateRequest {
     pub provider: String,
     pub model: String,
     pub api_key: String,
-    pub base_url: Option<String>,
+    /// Trusted endpoint stored with the key under ModelKeysManage.
+    /// Generation requests can never override it.
+    pub endpoint: Option<String>,
     pub description: String,
 }
 
@@ -76,10 +78,19 @@ pub fn extract_manifest_json(text: &str) -> &str {
     }
 }
 
-/// Rough pre-dispatch estimate: the description plus headroom for the
-/// generated manifest. Settle replaces it with observed usage.
+/// Output ceiling sent with every generation request. Kept beside the
+/// reservation bound so the two cannot drift apart.
+pub const MAX_OUTPUT_TOKENS: u32 = 4096;
+
+/// Conservative pre-dispatch reservation bound: the full request (system
+/// prompt plus description) plus the allowed output. Reserving less would
+/// let a call commit more than the budget admitted before observed usage
+/// lands at settle time.
 pub fn estimate_tokens(description: &str) -> i64 {
-    (description.chars().count() as i64) / 4 + 1024
+    // Byte length upper-bounds the token count for any BPE tokenizer (no
+    // token is shorter than one byte), so this is a true conservative bound
+    // on the request, plus the full allowed output.
+    (MANIFEST_SYSTEM_PROMPT.len() + description.len()) as i64 + i64::from(MAX_OUTPUT_TOKENS)
 }
 
 /// Production generator: one non-streaming completion per request, priced
@@ -94,10 +105,10 @@ impl ManifestGenerator for ProviderGenerator {
             provider,
             model,
             api_key,
-            base_url,
+            endpoint,
             description,
         } = request;
-        let adapter = build_adapter(&provider, api_key, model, base_url)?;
+        let adapter = build_adapter(&provider, api_key, &model, endpoint)?;
         let model_request = ModelRequest {
             messages: vec![
                 Message {
@@ -109,7 +120,7 @@ impl ManifestGenerator for ProviderGenerator {
                     content: description,
                 },
             ],
-            max_tokens: Some(4096),
+            max_tokens: Some(MAX_OUTPUT_TOKENS),
             temperature: Some(0.2),
         };
         let response = adapter.complete(model_request).await?;
@@ -124,22 +135,23 @@ impl ManifestGenerator for ProviderGenerator {
 fn build_adapter(
     provider: &str,
     api_key: String,
-    model: String,
-    base_url: Option<String>,
+    model: &str,
+    endpoint: Option<String>,
 ) -> Result<Box<dyn ModelAdapter>, ModelError> {
     match provider {
         "openai" => Ok(Box::new(OpenAiAdapter::openai(api_key, model, None)?)),
         "anthropic" => Ok(Box::new(AnthropicAdapter::new(api_key, model, None)?)),
         "gemini" => Ok(Box::new(GeminiAdapter::new(api_key, model, None)?)),
         "openai-compatible" => {
-            let base = base_url.ok_or_else(|| {
-                ModelError::Config("base_url is required for openai-compatible".into())
+            let base = endpoint.ok_or_else(|| {
+                ModelError::Config("stored key endpoint is required for openai-compatible".into())
             })?;
             Ok(Box::new(OpenAiAdapter::new(base, api_key, model, None)?))
         }
         "xiaomi" => {
-            let base = base_url
-                .ok_or_else(|| ModelError::Config("base_url is required for xiaomi".into()))?;
+            let base = endpoint.ok_or_else(|| {
+                ModelError::Config("stored key endpoint is required for xiaomi".into())
+            })?;
             Ok(Box::new(OpenAiAdapter::xiaomi(base, api_key, model, None)?))
         }
         _ => Err(ModelError::Config("unknown provider".into())),
@@ -167,7 +179,11 @@ mod tests {
     }
 
     #[test]
-    fn estimate_is_bounded_below() {
-        assert!(estimate_tokens("") >= 1024);
+    fn estimate_covers_the_whole_request_and_output() {
+        let bound = estimate_tokens("");
+        // The reserve includes the system prompt and the allowed output,
+        // not just a slice of the description.
+        assert!(bound > i64::from(MAX_OUTPUT_TOKENS) + 500, "{}", bound);
+        assert!(estimate_tokens("more input") > bound);
     }
 }

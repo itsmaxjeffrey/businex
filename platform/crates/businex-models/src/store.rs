@@ -193,6 +193,41 @@ pub async fn settle(
     usage: Option<Usage>,
     cost: Cost,
 ) -> Result<(), StoreError> {
+    settle_inner(
+        pool, company_id, reservation_id, provider, model, usage, cost, "observed",
+    )
+    .await
+}
+
+/// Settle a reservation whose call was dispatched but whose outcome is
+/// unknown (timeout or transport failure after the request left). The
+/// estimate is charged, never refunded as unspent: the provider may have
+/// processed the request. The usage row is marked "ambiguous" so the spend
+/// can be reconciled once the provider reports actual usage.
+pub async fn settle_ambiguous(
+    pool: &PgPool,
+    company_id: Uuid,
+    reservation_id: Uuid,
+    provider: &str,
+    model: &str,
+) -> Result<(), StoreError> {
+    settle_inner(
+        pool, company_id, reservation_id, provider, model, None, Cost::Unknown, "ambiguous",
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn settle_inner(
+    pool: &PgPool,
+    company_id: Uuid,
+    reservation_id: Uuid,
+    provider: &str,
+    model: &str,
+    usage: Option<Usage>,
+    cost: Cost,
+    outcome: &str,
+) -> Result<(), StoreError> {
     let mut tx = pool.begin().await?;
     pin_company(&mut tx, company_id).await?;
     let row: Option<(i64,)> = sqlx::query_as(
@@ -230,8 +265,8 @@ pub async fn settle(
     .await?;
     sqlx::query(
         r#"INSERT INTO model_usage
-           (id, company_id, provider, model, input_tokens, output_tokens, cost_micros, cost_known, reservation_id)
-           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9"#,
+           (id, company_id, provider, model, input_tokens, output_tokens, cost_micros, cost_known, reservation_id, outcome)
+           SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10"#,
     )
     .bind(Uuid::new_v4())
     .bind(company_id)
@@ -242,13 +277,16 @@ pub async fn settle(
     .bind(cost_micros)
     .bind(cost_known)
     .bind(reservation_id)
+    .bind(outcome)
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
     Ok(())
 }
 
-/// Release a reservation without accounting (call failed before usage).
+/// Release a reservation without accounting. Only valid when nothing was
+/// dispatched: after dispatch the outcome is unknown and must be settled
+/// through settle_ambiguous instead.
 /// Company scoped like settle.
 pub async fn release(
     pool: &PgPool,

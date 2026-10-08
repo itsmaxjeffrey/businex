@@ -84,6 +84,11 @@ struct NewKey {
     provider: String,
     label: String,
     key: String,
+    /// Trusted endpoint, stored with the key and validated here. Required
+    /// for self-hosted providers, refused for providers with fixed
+    /// endpoints. Generation can never override it.
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -105,8 +110,10 @@ struct GenerateBody {
     model: String,
     #[serde(default)]
     label: Option<String>,
-    #[serde(default)]
-    base_url: Option<String>,
+    // No endpoint field on purpose: the only address a company key is ever
+    // sent to is the one stored with the key under ModelKeysManage. A
+    // request carrying base_url is rejected as an unknown field before any
+    // dispatch.
 }
 
 /// Register a provider key for this company. The plaintext appears once in
@@ -145,6 +152,32 @@ async fn create_key(
             message: "key must be 1-512 characters".into(),
         }));
     }
+    // The endpoint is trusted configuration: validated once here, stored
+    // with the key, and never taken from a generation request.
+    let self_hosted = matches!(body.provider.as_str(), "openai-compatible" | "xiaomi");
+    let endpoint = match body.endpoint {
+        Some(raw) if self_hosted => {
+            let trimmed = raw.trim().trim_end_matches('/').to_string();
+            businex_models::urlpolicy::validate_endpoint(&trimmed).map_err(|_| {
+                error_response(&Error::Invalid {
+                    message: "endpoint must be an absolute https URL (http allowed for loopback only)"
+                        .into(),
+                })
+            })?;
+            Some(trimmed)
+        }
+        Some(_) => {
+            return Err(error_response(&Error::Invalid {
+                message: "endpoint override is not allowed for this provider".into(),
+            }))
+        }
+        None if self_hosted => {
+            return Err(error_response(&Error::Invalid {
+                message: "self-hosted providers require an explicitly configured endpoint".into(),
+            }))
+        }
+        None => None,
+    };
     let sealed = master
         .seal(
             company_id.to_string(),
@@ -159,13 +192,14 @@ async fn create_key(
         .map_err(tx_err)?;
     let key_id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO model_keys (id, company_id, provider, label, sealed_nonce, sealed_bytes, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        "INSERT INTO model_keys (id, company_id, provider, label, endpoint, sealed_nonce, sealed_bytes, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(key_id)
     .bind(company_id)
     .bind(body.provider.as_str())
     .bind(body.label.as_str())
+    .bind(endpoint.as_deref())
     .bind(sealed.nonce.as_slice())
     .bind(sealed.ciphertext.as_slice())
     .bind(user.id)
@@ -191,7 +225,8 @@ async fn create_key(
         json!({"provider": body.provider, "label": body.label}),
     )
     .await;
-    Ok(Json(json!({"id": key_id, "provider": body.provider, "label": body.label})).into_response())
+    Ok(Json(json!({"id": key_id, "provider": body.provider, "label": body.label,
+                   "endpoint": endpoint})).into_response())
 }
 
 /// Key metadata only: never sealed bytes, never plaintext.
@@ -206,8 +241,8 @@ async fn list_keys(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
-    let rows: Vec<(Uuid, String, String, String, Option<String>)> = sqlx::query_as(
-        "SELECT id, provider, label, created_at::text, revoked_at::text
+    let rows: Vec<(Uuid, String, String, Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, provider, label, endpoint, created_at::text, revoked_at::text
          FROM model_keys WHERE company_id = $1 ORDER BY created_at DESC",
     )
     .bind(company_id)
@@ -217,8 +252,8 @@ async fn list_keys(
     tx.commit().await.map_err(tx_err)?;
     let keys: Vec<_> = rows
         .into_iter()
-        .map(|(id, provider, label, created_at, revoked_at)| {
-            json!({"id": id, "provider": provider, "label": label,
+        .map(|(id, provider, label, endpoint, created_at, revoked_at)| {
+            json!({"id": id, "provider": provider, "label": label, "endpoint": endpoint,
                    "created_at": created_at, "revoked_at": revoked_at})
         })
         .collect();
@@ -369,18 +404,6 @@ fn validate_generate(body: &GenerateBody) -> Result<(), Response> {
             }));
         }
     }
-    if body.base_url.as_deref().unwrap_or("").len() > 512 {
-        return Err(error_response(&Error::Invalid {
-            message: "base_url is too long".into(),
-        }));
-    }
-    if matches!(body.provider.as_str(), "openai-compatible" | "xiaomi")
-        && body.base_url.is_none()
-    {
-        return Err(error_response(&Error::Invalid {
-            message: "base_url is required for this provider".into(),
-        }));
-    }
     Ok(())
 }
 
@@ -406,8 +429,8 @@ async fn generate_app(
     let mut tx = businex_db::begin_company_tx(&state.pool, ctx)
         .await
         .map_err(tx_err)?;
-    let row: Option<(Vec<u8>, Vec<u8>)> = sqlx::query_as(
-        "SELECT sealed_nonce, sealed_bytes FROM model_keys
+    let row: Option<(Vec<u8>, Vec<u8>, Option<String>)> = sqlx::query_as(
+        "SELECT sealed_nonce, sealed_bytes, endpoint FROM model_keys
          WHERE company_id = $1 AND provider = $2 AND revoked_at IS NULL
            AND ($3::text IS NULL OR label = $3)
          ORDER BY created_at DESC LIMIT 1",
@@ -419,7 +442,7 @@ async fn generate_app(
     .await
     .map_err(db_err)?;
     tx.commit().await.map_err(tx_err)?;
-    let (nonce, ciphertext) = row.ok_or_else(|| {
+    let (nonce, ciphertext, endpoint) = row.ok_or_else(|| {
         error_response(&Error::NotFound {
             entity: "model key".into(),
         })
@@ -443,15 +466,32 @@ async fn generate_app(
             provider: body.provider.clone(),
             model: body.model.clone(),
             api_key,
-            base_url: body.base_url.clone(),
+            endpoint,
             description: body.description.clone(),
         })
         .await
     {
         Ok(outcome) => outcome,
         Err(e) => {
-            if let Err(release_err) = store::release(&state.pool, company_id, reservation).await {
-                tracing::error!(error = ?release_err, "model reservation release failed");
+            // A config failure happens before any network I/O, so the call
+            // provably never ran and the capacity is released untouched.
+            // Every other failure may have reached the provider: the
+            // reservation is settled as an unknown outcome for later
+            // reconciliation, never released as unspent capacity.
+            let accounting = if matches!(e, ModelError::Config(_)) {
+                store::release(&state.pool, company_id, reservation).await
+            } else {
+                store::settle_ambiguous(
+                    &state.pool,
+                    company_id,
+                    reservation,
+                    &body.provider,
+                    &body.model,
+                )
+                .await
+            };
+            if let Err(account_err) = accounting {
+                tracing::error!(error = ?account_err, "model reservation accounting failed");
             }
             return Err(model_err(e));
         }

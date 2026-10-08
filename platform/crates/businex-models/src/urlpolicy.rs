@@ -24,8 +24,15 @@ pub fn is_loopback(base_url: &str) -> bool {
 /// HTTP client for a provider endpoint. Loopback endpoints skip the ambient
 /// proxy configuration so local development and contract tests connect
 /// directly; remote endpoints honor deployment proxy settings.
+///
+/// Redirects are never followed: a redirect response could otherwise carry
+/// the request (including its authorization header) to an endpoint nobody
+/// configured. The connect timeout bounds how long a hostile endpoint can
+/// hold a dispatch open.
 pub fn build_client(base_url: &str) -> reqwest::Client {
-    let mut builder = reqwest::Client::builder();
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10));
     if is_loopback(base_url) {
         builder = builder.no_proxy();
     }

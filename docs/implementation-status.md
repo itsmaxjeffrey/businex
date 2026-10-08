@@ -11,7 +11,9 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-41). Run 41 adds the businex-builder
+Last updated: 2026-10-08 (runs 1-42). Run 42 (PM builder review
+fixes): api+core+models 139 passing, 0 failed, exit 0
+(log /tmp/businex-run42.log). Run 41 adds the businex-builder
 crate: 14 passing, 0 failed (10 unit + 4 docker-gated integration,
 log /tmp/businex-run41.log). Backend re-measured in run 40
 (cargo test -p businex-api -p businex-core -p businex-models, exit 0,
@@ -156,6 +158,15 @@ a load-sensitive race in the single-flight refresh dedup or its test.
 | G4 | Generic record permissions with no enforced warehouse/member versus manager entity-action rules; essential for inventory acceptance and not fulfilled by company-wide RecordsWrite | implemented | EntityDef.access declares read/write/delete role floors per entity and enforcement narrows the company permission (a floor can only raise the requirement, never grant beyond the role). entity_action_rules_narrow_writes_by_role: members write items but only managers write stocktakes despite holding records.write, the read floor narrows listing the same way, and deletes are admin-only even for a manager holding records.delete (run 40). Full inventory acceptance (A2) still requires the generated-app execution slice |
 | G5 | Current version hash is manifest hash only, not compiled artifact proof | documented | app_versions.bundle_hash is SHA-256 of the canonical manifest JSON and is claimed as exactly that everywhere in this tracker. The distinction is now enforced by code (run 41): businex-builder::Artifact::hash is a content-addressed SHA-256 over every compiled output file (sorted path + per-file digest), so identical builds hash identically and any byte or path change moves it (unit-proven; stable across real rebuilds in isolated_build_compiles_typechecks_and_executes). app_versions.bundle_hash remains the manifest hash and is still claimed as exactly that; wiring the artifact hash into app_versions as a separate recorded value lands with the code-version API |
 
+## PM builder review follow-ups (2026-10-08)
+
+| ID | Review requirement | Status | Evidence |
+| --- | --- | --- | --- |
+| G6 | GenerateBody.base_url is request-controlled while generate opens a stored company key: an AppsManage caller can redirect key material to their own endpoint. Store the trusted endpoint with the provider key under ModelKeysManage, disallow per-generation endpoint override, validate redirects/egress, require explicitly configured local endpoints for self-hosted models. Add a denial test proving an unauthorized endpoint cannot receive the key | fixed | The endpoint is now key configuration, not request input. model_keys.endpoint (migration 0009) is set at key creation under ModelKeysManage and validated by businex_models::urlpolicy::validate_endpoint (https, or http for explicitly configured loopback self-hosting only; private/link-local literal addresses refused). Self-hosted providers (openai-compatible, xiaomi) require an explicit endpoint at key creation; providers with fixed endpoints refuse overrides entirely. GenerateBody has no endpoint field and deny_unknown_fields rejects any base_url attempt before dispatch. The adapter HTTP client never follows redirects and has a connect timeout. Denial proof: generation_cannot_redirect_a_key_to_an_unauthorized_endpoint shows a request-supplied base_url is refused pre-dispatch with zero generator calls and the key never leaving storage, while the legitimate call carries exactly the stored endpoint and the key goes there and only there (run 42) |
+| G7 | Budget estimate (description chars/4 + 1024) omits the system prompt and the allowed 4096-token output; reserve a conservative full-request bound | fixed | estimate_tokens now reserves the system prompt plus description bytes (an upper bound on token count for any BPE tokenizer) plus the full output allowance MAX_OUTPUT_TOKENS = 4096, which is also what the request itself asks for. Unit proof estimate_covers_the_whole_request_and_output asserts the bound exceeds output + prompt and grows with input (run 42) |
+| G8 | Do not release a reservation as unspent for an ambiguous provider timeout after dispatch; persist the unknown outcome for reconciliation | fixed | Failure accounting now branches on what is knowable. A pre-dispatch config failure provably never reached the provider and releases the reservation untouched (a_pre_dispatch_failure_releases_its_reservation). Every post-dispatch failure settles the reservation through store::settle_ambiguous: the estimate stays charged, cost stays unknown, and model_usage.outcome = 'ambiguous' marks the row for reconciliation instead of silently refunding capacity the provider may have consumed. Proven at the API and the store layer (an_ambiguous_failure_is_charged_and_recorded_for_reconciliation, ambiguous_outcome_is_charged_and_recorded_for_reconciliation: estimate charged, reservation closed, outcome persisted, double settle/release refused — run 42) |
+| G9 | build_adapter expects String but the caller passes &request.model | fixed | build_adapter now takes model: &str and the call site passes &model; whole workspace compiles clean (run 42) |
+
 ## Browser e2e milestone (2026-10-08)
 
 | ID | Item | Status | Evidence |
@@ -170,7 +181,7 @@ a load-sensitive race in the single-flight refresh dedup or its test.
 
 Per-document-load numbers recorded inside the browser runs (run 39): desktop cold-register load 89ms / DCL 84ms / FCP 252ms, warm-home load 56ms / DCL 45ms / FCP 128ms; mobile cold-register load 88ms / DCL 83ms / FCP 204ms, warm-home load 38ms / DCL 37ms / FCP 92ms. These are synthetic local-lab document-load timings measured by the harness against vite preview on loopback — not real-user metrics such as LCP or INP, and never to be quoted as such.
 
-Run evidence: /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
+Run evidence: /tmp/businex-run42.log (api+core+models 139/0, exit 0), /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
 
 ## Known gates and limitations
 
@@ -181,4 +192,5 @@ Run evidence: /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40
 - Windows desktop build: no local toolchain; public GitHub Actions runners are acceptable for Windows builds (PM, 2026-10-08). A physical Windows host is not a blocker; the Windows artifact is simply not built yet.
 - app_versions.bundle_hash is a manifest hash, not compiled-artifact proof (G5); the compiled-artifact hash exists in businex-builder and is wired into app_versions with the code-version API.
 - npm dependency vendoring is not implemented: businex-builder refuses non-empty dependency lists and fails closed; custom apps so far target dependency-free code.
+- The generator is still synchronous and manifest-only. Durable generation jobs and the custom TypeScript build/test/preview/runtime pipeline are the next milestone; kind=code existing in the manifest enum is not acceptance.
 - One known intermittent test (not claimed fixed): tests/oidc.rs::concurrent_signature_failures_share_a_single_refresh failed once under full-suite load (3 discovery fetches observed, 2 expected) and passed 3/3 isolated plus in run 40; the single-flight refresh dedup or its test has a load-sensitive race (see /tmp/businex-run40.log).

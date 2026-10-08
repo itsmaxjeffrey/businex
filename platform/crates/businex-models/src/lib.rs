@@ -27,7 +27,8 @@ pub use keys::{KeyError, MasterKey, SealedKey};
 pub use openai::OpenAiAdapter;
 pub use pricing::PricingTable;
 pub use store::{
-    get_budget, release, reserve, set_budget, settle, BudgetRow, DenyReason, StoreError,
+    get_budget, release, reserve, set_budget, settle, settle_ambiguous, BudgetRow, DenyReason,
+    StoreError,
 };
 pub use types::{
     compute_cost, Cost, Message, ModelError, ModelRequest, ModelResponse, Price, Role, StreamEvent,

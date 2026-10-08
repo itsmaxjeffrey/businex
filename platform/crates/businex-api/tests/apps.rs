@@ -723,26 +723,43 @@ async fn entity_action_rules_narrow_writes_by_role() {
 
 /// Scripted generator standing in for the provider adapters. Records every
 /// call and the unsealed key it was handed.
+#[derive(Clone, Copy)]
+enum Fail {
+    /// Fails before any network I/O: nothing was ever dispatched.
+    Config,
+    /// Fails after dispatch: the call may have run at the provider.
+    Provider,
+}
+
 struct FakeGenerator {
     text: String,
-    fail: bool,
+    fail: Option<Fail>,
     calls: AtomicUsize,
     seen_key: Mutex<Option<String>>,
+    seen_endpoint: Mutex<Option<String>>,
 }
 
 impl FakeGenerator {
     fn ok() -> Self {
         FakeGenerator {
             text: manifest_v1().to_string(),
-            fail: false,
+            fail: None,
             calls: AtomicUsize::new(0),
             seen_key: Mutex::new(None),
+            seen_endpoint: Mutex::new(None),
         }
     }
 
     fn failing() -> Self {
         FakeGenerator {
-            fail: true,
+            fail: Some(Fail::Provider),
+            ..Self::ok()
+        }
+    }
+
+    fn config_failure() -> Self {
+        FakeGenerator {
+            fail: Some(Fail::Config),
             ..Self::ok()
         }
     }
@@ -760,8 +777,11 @@ impl ManifestGenerator for FakeGenerator {
     async fn generate(&self, request: GenerateRequest) -> Result<GenerateOutcome, ModelError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         *self.seen_key.lock().expect("lock") = Some(request.api_key);
-        if self.fail {
-            return Err(ModelError::Provider);
+        *self.seen_endpoint.lock().expect("lock") = request.endpoint.clone();
+        match self.fail {
+            Some(Fail::Config) => return Err(ModelError::Config("test config failure".into())),
+            Some(Fail::Provider) => return Err(ModelError::Provider),
+            None => {}
         }
         Ok(GenerateOutcome {
             text: self.text.clone(),
@@ -984,12 +1004,50 @@ async fn generate_is_denied_before_dispatch_when_the_budget_is_spent() {
     assert_eq!(body["budget"]["settled_tokens"], 0, "{}", body);
 }
 
-// A failed model call releases its reservation: the company is never charged
-// for a call that did not happen.
+// A pre-dispatch configuration failure provably never reached the provider,
+// so the reservation is released untouched.
 #[tokio::test]
-async fn a_failed_model_call_releases_its_reservation() {
-    let fake = Arc::new(FakeGenerator::failing());
+async fn a_pre_dispatch_failure_releases_its_reservation() {
+    let fake = Arc::new(FakeGenerator::config_failure());
     let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let budget_uri = format!("/api/companies/{}/model-budget", company);
+
+    let (status, _) = owner
+        .post(
+            &format!("/api/companies/{}/model-keys", company),
+            json!({"provider": "openai", "label": "default", "key": "sk-1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = owner
+        .put(&budget_uri, json!({"max_tokens_per_period": 10000}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = owner
+        .post(
+            &format!("/api/companies/{}/apps/generate", company),
+            json!({"description": "An inventory tracker", "provider": "openai", "model": "test-model"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{}", body);
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
+
+    let (status, body) = owner.get(&budget_uri).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(body["budget"]["reserved_tokens"], 0, "{}", body);
+    assert_eq!(body["budget"]["settled_tokens"], 0, "{}", body);
+}
+
+// A failure after dispatch has an unknown outcome: the provider may have run
+// the call. The estimate stays charged and the usage row records the unknown
+// outcome for reconciliation instead of silently refunding the capacity.
+#[tokio::test]
+async fn an_ambiguous_failure_is_charged_and_recorded_for_reconciliation() {
+    let fake = Arc::new(FakeGenerator::failing());
+    let (db, state) = model_test_state(fake.clone()).await;
     let (mut owner, _addr) = register(router(state.clone()), "owner").await;
     let company = create_company(&mut owner, "Acme").await;
     let budget_uri = format!("/api/companies/{}/model-budget", company);
@@ -1015,10 +1073,125 @@ async fn a_failed_model_call_releases_its_reservation() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{}", body);
     assert_eq!(fake.calls.load(Ordering::SeqCst), 1);
 
+    // The conservative estimate stays charged; nothing was refunded.
+    let expected = businex_api::builder::estimate_tokens("An inventory tracker");
     let (status, body) = owner.get(&budget_uri).await;
     assert_eq!(status, StatusCode::OK, "{}", body);
     assert_eq!(body["budget"]["reserved_tokens"], 0, "{}", body);
-    assert_eq!(body["budget"]["settled_tokens"], 0, "{}", body);
+    assert_eq!(body["budget"]["settled_tokens"], expected, "{}", body);
+    assert_eq!(body["budget"]["unknown_cost_calls"], 1, "{}", body);
+
+    // And the row says the outcome is unknown, for reconciliation.
+    let mut conn = db.pool.acquire().await.expect("connection");
+    sqlx::query("SELECT set_config('businex.company_id', $1, false)")
+        .bind(&company)
+        .execute(&mut *conn)
+        .await
+        .expect("tenant pin");
+    let outcome: (String,) =
+        sqlx::query_as("SELECT outcome FROM model_usage WHERE company_id = $1::uuid")
+            .bind(&company)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("usage row");
+    assert_eq!(outcome.0, "ambiguous", "unknown outcome persisted");
+}
+
+// The endpoint is trusted configuration stored with the key: generation
+// requests can never redirect a key anywhere else. An unauthorized endpoint
+// receives nothing, not even a dispatch attempt.
+#[tokio::test]
+async fn generation_cannot_redirect_a_key_to_an_unauthorized_endpoint() {
+    let fake = Arc::new(FakeGenerator::ok());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let keys = format!("/api/companies/{}/model-keys", company);
+    let generate_uri = format!("/api/companies/{}/apps/generate", company);
+
+    // Self-hosted keys must state their endpoint explicitly.
+    let (status, body) = owner
+        .post(&keys, json!({"provider": "xiaomi", "label": "local", "key": "sk-1"}))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+
+    // And the endpoint must pass the egress policy: private targets die.
+    let (status, body) = owner
+        .post(
+            &keys,
+            json!({"provider": "xiaomi", "label": "local", "key": "sk-1",
+                   "endpoint": "http://10.0.0.5:8080/v1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+
+    // An explicit loopback endpoint is accepted for development self-hosting.
+    let (status, body) = owner
+        .post(
+            &keys,
+            json!({"provider": "xiaomi", "label": "local", "key": "sk-1",
+                   "endpoint": "http://127.0.0.1:9999/v1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+
+    // Providers with fixed endpoints refuse overrides entirely.
+    let (status, body) = owner
+        .post(
+            &keys,
+            json!({"provider": "openai", "label": "cloud", "key": "sk-2",
+                   "endpoint": "https://evil.example/v1"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{}", body);
+
+    // A generation request carrying its own endpoint is refused before any
+    // dispatch: the unauthorized endpoint receives the key never.
+    let (status, body) = owner
+        .post(
+            &generate_uri,
+            json!({
+                "description": "An inventory tracker",
+                "provider": "xiaomi",
+                "model": "test-model",
+                "label": "local",
+                "base_url": "https://evil.example/v1"
+            }),
+        )
+        .await;
+    assert!(status.is_client_error(), "{}", body);
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "nothing was dispatched"
+    );
+    assert!(
+        fake.seen_key.lock().expect("lock").is_none(),
+        "the key never left storage"
+    );
+
+    // The legitimate call carries exactly the stored endpoint and nothing
+    // else; the key goes there and only there.
+    let (status, body) = owner
+        .post(
+            &generate_uri,
+            json!({
+                "description": "An inventory tracker",
+                "provider": "xiaomi",
+                "model": "test-model",
+                "label": "local"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    assert_eq!(
+        fake.seen_endpoint.lock().expect("lock").as_deref(),
+        Some("http://127.0.0.1:9999/v1")
+    );
+    assert_eq!(
+        fake.seen_key.lock().expect("lock").as_deref(),
+        Some("sk-1")
+    );
 }
 
 // Unusable model output is still a real, charged call: the usage is settled

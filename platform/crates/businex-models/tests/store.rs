@@ -118,6 +118,51 @@ async fn unknown_usage_charges_estimate_and_unknown_cost_never_zeroes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_outcome_is_charged_and_recorded_for_reconciliation() {
+    let db = TestDb::new().await;
+    let company = setup_company(&db).await;
+    let reservation = store::reserve(&db.pool, company, 50)
+        .await
+        .expect("reserve");
+    // The call was dispatched but its outcome is unknown (timeout after
+    // dispatch). The estimate stays charged and the row records the unknown
+    // outcome for reconciliation instead of refunding the capacity.
+    store::settle_ambiguous(&db.pool, company, reservation, "test", "test-model")
+        .await
+        .expect("settle ambiguous");
+    let budget = store::get_budget(&db.pool, company)
+        .await
+        .expect("get")
+        .expect("row");
+    assert_eq!(budget.settled_tokens, 50, "the estimate stays charged");
+    assert_eq!(budget.reserved_tokens, 0, "the reservation is closed");
+    assert_eq!(budget.unknown_cost_calls, 1, "unknown cost never zeroes");
+
+    let mut conn = db.pool.acquire().await.expect("connection");
+    sqlx::query("SELECT set_config('businex.company_id', $1, false)")
+        .bind(company.to_string())
+        .execute(&mut *conn)
+        .await
+        .expect("tenant pin");
+    let outcome: (String,) =
+        sqlx::query_as("SELECT outcome FROM model_usage WHERE company_id = $1")
+            .bind(company)
+            .fetch_one(&mut *conn)
+            .await
+            .expect("usage row");
+    assert_eq!(outcome.0, "ambiguous", "unknown outcome persisted");
+
+    // The closed reservation can neither be released as unspent nor settled
+    // a second time.
+    let closed = store::release(&db.pool, company, reservation).await;
+    assert!(
+        matches!(closed, Err(StoreError::ReservationClosed)),
+        "{:?}",
+        closed
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn cost_budget_denies_when_exhausted() {
     let db = TestDb::new().await;
     let company = setup_company(&db).await;
