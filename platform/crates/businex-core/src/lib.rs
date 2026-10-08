@@ -8,6 +8,8 @@
 //! "records.write") everywhere: manifests, SDK, API and logs. Parsing is
 //! strict: an unknown permission is an error, never silently ignored.
 
+pub mod app_manifest;
+
 use chrono::{DateTime, Utc};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};

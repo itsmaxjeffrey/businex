@@ -60,7 +60,10 @@ fn map_auth(err: AuthError) -> Response {
     }
 }
 
-async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<CurrentUser, Response> {
+pub(crate) async fn current_user(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<CurrentUser, Response> {
     let token = token_from_headers(headers).ok_or_else(|| map_auth(AuthError::NoSession))?;
     let (user, _) = user_from_token(&state.pool, &token)
         .await
@@ -71,7 +74,7 @@ async fn current_user(state: &AppState, headers: &HeaderMap) -> Result<CurrentUs
 /// Load the verified membership and build the authorization from it. The
 /// stored scope: empty resources means the membership's role applies across
 /// the company (explicit membership decision); non-empty resources narrow it.
-async fn authorize(
+pub(crate) async fn authorize(
     state: &AppState,
     user: &CurrentUser,
     company_id: Uuid,
@@ -130,7 +133,7 @@ async fn authorize(
     Ok(auth)
 }
 
-async fn audit(
+pub(crate) async fn audit(
     state: &AppState,
     auth: &Authorization,
     action: &str,

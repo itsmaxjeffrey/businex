@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 pub mod auth;
 pub mod oidc;
 pub mod ratelimit;
+pub mod routes_apps;
 pub mod routes_identity;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -73,6 +74,7 @@ pub fn router(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/api/health", get(api_health))
         .merge(routes_identity::router())
+        .merge(routes_apps::router())
         .merge(oidc::router())
         .layer(TraceLayer::new_for_http())
         .layer(PropagateRequestIdLayer::new(x_request_id.clone()))

@@ -19,10 +19,25 @@ pub const SERVICE_ROLE: &str = "businex_service";
 
 /// Build a pool with sensible limits. The URL must use a role allowed to
 /// access the schema; production connects as businex_app.
+///
+/// Every connection gets a pinned search path. Unqualified table names in
+/// queries and migrations then resolve the same way for every role —
+/// application role, service role and the migrating admin — instead of
+/// silently depending on the per-role default ("$user", public). The
+/// businex schema stays visible because the SECURITY DEFINER functions
+/// live there.
 pub async fn connect(url: &str, max_connections: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
         .max_connections(max_connections)
         .acquire_timeout(std::time::Duration::from_secs(10))
+        .after_connect(|conn, _opts| {
+            Box::pin(async move {
+                sqlx::query("SET search_path TO public, businex")
+                    .execute(conn)
+                    .await
+                    .map(|_| ())
+            })
+        })
         .connect(url)
         .await
 }
