@@ -282,6 +282,7 @@ dependencies = [
  "businex-core",
  "businex-db",
  "businex-events",
+ "businex-models",
  "businex-queue",
  "chrono",
  "hex",

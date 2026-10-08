@@ -19,6 +19,7 @@ sha2.workspace = true
 businex-core.workspace = true
 businex-db.workspace = true
 businex-events.workspace = true
+businex-models.workspace = true
 businex-queue.workspace = true
 chrono.workspace = true
 serde.workspace = true
