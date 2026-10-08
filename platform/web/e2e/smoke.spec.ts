@@ -5,7 +5,9 @@ import { expect, test, type Page } from "@playwright/test";
 // instance and the production bundle. In-page document-load numbers are
 // printed as E2E_PERF lines for the implementation tracker.
 
-const STAMP = Date.now();
+// Unique per test run: the same file executes once per Playwright project
+// (desktop and mobile) against one shared API, so accounts must not collide.
+const STAMP = Date.now() + "-" + Math.random().toString(36).slice(2, 8);
 
 interface Perf {
   dclMs: number;
