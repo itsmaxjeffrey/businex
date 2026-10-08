@@ -122,6 +122,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Versioned price configuration: Price records carry an effective date
+    // and an estimate flag, and every one is validated before use. Unset
+    // means each call's cost is unknown and the company budget policy
+    // (deny_when_cost_unknown) decides - prices are never guessed.
+    let pricing = match std::env::var("BUSINEX_MODEL_PRICING_FILE") {
+        Ok(path) => {
+            let raw = std::fs::read_to_string(&path)?;
+            let prices: Vec<businex_models::Price> = serde_json::from_str(&raw)?;
+            let mut table = businex_models::PricingTable::empty();
+            for price in prices {
+                table.insert(price)?;
+            }
+            std::sync::Arc::new(table)
+        }
+        Err(_) => std::sync::Arc::new(businex_models::PricingTable::empty()),
+    };
+
     let app = router(AppState {
         pool: pool.clone(),
         relay: relay.clone(),
@@ -131,6 +148,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         oidc: oidc_rt,
         master_key,
         generator: std::sync::Arc::new(businex_api::builder::ProviderGenerator),
+        pricing,
     });
 
     let addr = format!("{}:{}", host, port);

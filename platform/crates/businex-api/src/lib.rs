@@ -59,6 +59,10 @@ pub struct AppState {
     /// Model call seam: production uses the provider adapters, tests inject
     /// a scripted generator.
     pub generator: std::sync::Arc<dyn builder::ManifestGenerator>,
+    /// Versioned price configuration (Price records carry an effective date
+    /// and an estimate flag). Empty means every call has unknown cost and the
+    /// unknown-cost budget policy applies.
+    pub pricing: std::sync::Arc<businex_models::PricingTable>,
 }
 
 impl AppState {
@@ -73,6 +77,7 @@ impl AppState {
             oidc: None,
             master_key: None,
             generator: std::sync::Arc::new(builder::ProviderGenerator),
+            pricing: std::sync::Arc::new(businex_models::PricingTable::empty()),
         }
     }
 }

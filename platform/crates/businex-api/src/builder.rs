@@ -8,7 +8,7 @@
 use async_trait::async_trait;
 use businex_models::{
     AnthropicAdapter, Cost, GeminiAdapter, Message, ModelAdapter, ModelError, ModelRequest,
-    OpenAiAdapter, Role, Usage,
+    OpenAiAdapter, Price, Role, Usage,
 };
 
 /// Providers a company may register keys for and generate with.
@@ -29,6 +29,9 @@ pub struct GenerateRequest {
     /// Trusted endpoint stored with the key under ModelKeysManage.
     /// Generation requests can never override it.
     pub endpoint: Option<String>,
+    /// Versioned configured price for this provider/model pair. Absent means
+    /// the call's cost is unknown; nothing here is ever guessed.
+    pub price: Option<Price>,
     pub description: String,
 }
 
@@ -106,9 +109,10 @@ impl ManifestGenerator for ProviderGenerator {
             model,
             api_key,
             endpoint,
+            price,
             description,
         } = request;
-        let adapter = build_adapter(&provider, api_key, &model, endpoint)?;
+        let adapter = build_adapter(&provider, api_key, &model, endpoint, price)?;
         let model_request = ModelRequest {
             messages: vec![
                 Message {
@@ -137,22 +141,25 @@ fn build_adapter(
     api_key: String,
     model: &str,
     endpoint: Option<String>,
+    price: Option<Price>,
 ) -> Result<Box<dyn ModelAdapter>, ModelError> {
     match provider {
-        "openai" => Ok(Box::new(OpenAiAdapter::openai(api_key, model, None)?)),
-        "anthropic" => Ok(Box::new(AnthropicAdapter::new(api_key, model, None)?)),
-        "gemini" => Ok(Box::new(GeminiAdapter::new(api_key, model, None)?)),
+        // The configured price threads through to the adapter so a priced
+        // call settles with a real cost; unknown stays unknown, never zero.
+        "openai" => Ok(Box::new(OpenAiAdapter::openai(api_key, model, price)?)),
+        "anthropic" => Ok(Box::new(AnthropicAdapter::new(api_key, model, price)?)),
+        "gemini" => Ok(Box::new(GeminiAdapter::new(api_key, model, price)?)),
         "openai-compatible" => {
             let base = endpoint.ok_or_else(|| {
                 ModelError::Config("stored key endpoint is required for openai-compatible".into())
             })?;
-            Ok(Box::new(OpenAiAdapter::new(base, api_key, model, None)?))
+            Ok(Box::new(OpenAiAdapter::new(base, api_key, model, price)?))
         }
         "xiaomi" => {
             let base = endpoint.ok_or_else(|| {
                 ModelError::Config("stored key endpoint is required for xiaomi".into())
             })?;
-            Ok(Box::new(OpenAiAdapter::xiaomi(base, api_key, model, None)?))
+            Ok(Box::new(OpenAiAdapter::xiaomi(base, api_key, model, price)?))
         }
         _ => Err(ModelError::Config("unknown provider".into())),
     }

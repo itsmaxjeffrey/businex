@@ -33,6 +33,21 @@ impl PricingTable {
     }
 }
 
+/// Conservative upper bound on what one call can cost when its total token
+/// count is bounded by estimate_tokens: every token priced at the higher of
+/// the two rates, rounded up. Used to reserve money before dispatch; the
+/// observed cost replaces it at settle time. None on overflow (fail closed)
+/// or a negative token bound.
+pub fn cost_upper_bound(price: &Price, estimate_tokens: i64) -> Option<i64> {
+    if estimate_tokens < 0 {
+        return None;
+    }
+    let rate = price.input_micros_per_mtok.max(price.output_micros_per_mtok) as u128;
+    let micros = rate.checked_mul(estimate_tokens as u128)?;
+    let micros = micros.checked_add(999_999)? / 1_000_000;
+    i64::try_from(micros).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +129,24 @@ mod tests {
         let mut bad_date = price();
         bad_date.effective_date = "yesterday".into();
         assert!(table.insert(bad_date).is_err());
+    }
+
+    #[test]
+    fn cost_upper_bound_is_conservative_and_checked() {
+        let p = price();
+        // 500 tokens priced at the higher rate (8 micros per token).
+        assert_eq!(cost_upper_bound(&p, 500), Some(4_000));
+        assert_eq!(cost_upper_bound(&p, 0), Some(0));
+        assert_eq!(cost_upper_bound(&p, -1), None, "negative bounds are invalid");
+        let mut tiny = price();
+        tiny.input_micros_per_mtok = 1;
+        tiny.output_micros_per_mtok = 1;
+        assert_eq!(cost_upper_bound(&tiny, 500_000), Some(1), "rounds up, never down");
+        assert_eq!(cost_upper_bound(&tiny, 1), Some(1), "a real call is never free");
+        let mut huge = price();
+        huge.input_micros_per_mtok = u64::MAX;
+        huge.output_micros_per_mtok = u64::MAX;
+        assert_eq!(cost_upper_bound(&huge, i64::MAX), None, "overflow fails closed");
     }
 
     #[test]

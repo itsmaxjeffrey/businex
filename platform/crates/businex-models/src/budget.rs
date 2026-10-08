@@ -5,6 +5,10 @@
 //! calls each pass the same remaining balance. Unknown price or unknown usage
 //! never counts as free: the reservation settles conservatively and stays
 //! explicit-unknown in the totals.
+//!
+//! Scope: this in-memory ledger is a unit-test helper for token semantics.
+//! Monetary cost reservation and the durable accounting live in store.rs,
+//! and no test here is evidence of a hard spending limit.
 
 use crate::types::{Cost, Usage};
 use serde::{Deserialize, Serialize};
@@ -20,8 +24,8 @@ pub struct Budget {
     /// Only enforceable for priced usage; unknown-cost usage is tracked and
     /// policy can require denial (deny_when_cost_unknown).
     pub max_cost_micros_per_period: Option<i64>,
-    /// When true, calls whose cost cannot be computed are denied under a cost
-    /// budget instead of being admitted with unknown cost.
+    /// When true, calls whose cost cannot be computed are denied outright -
+    /// this policy binds with or without a monetary cap.
     pub deny_when_cost_unknown: bool,
 }
 
@@ -111,16 +115,18 @@ impl BudgetLedger {
                 });
             }
         }
+        // The unknown-cost policy binds on its own: deny_when_cost_unknown
+        // forbids unknown-price calls even when no monetary cap is set.
+        if budget.deny_when_cost_unknown {
+            return Err(BudgetDecision::DenyUnknownCost {
+                reason: "cost is unknown before the call".into(),
+            });
+        }
         if let Some(max) = budget.max_cost_micros_per_period {
             if totals.settled_cost_micros >= max {
                 return Err(BudgetDecision::DenyCost {
                     committed_cost_micros: totals.settled_cost_micros,
                     max_cost_micros: max,
-                });
-            }
-            if budget.deny_when_cost_unknown {
-                return Err(BudgetDecision::DenyUnknownCost {
-                    reason: "cost is unknown before the call".into(),
                 });
             }
         }
@@ -251,6 +257,24 @@ mod tests {
             company,
             Budget {
                 max_cost_micros_per_period: Some(1_000_000),
+                deny_when_cost_unknown: true,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            ledger.reserve(company, 1),
+            Err(BudgetDecision::DenyUnknownCost { .. })
+        ));
+    }
+
+    #[test]
+    fn deny_unknown_cost_policy_binds_without_a_cap() {
+        let ledger = BudgetLedger::new();
+        let company = Uuid::new_v4();
+        // No monetary cap at all: the policy still refuses unknown-price calls.
+        ledger.set_budget(
+            company,
+            Budget {
                 deny_when_cost_unknown: true,
                 ..Default::default()
             },

@@ -457,7 +457,15 @@ async fn generate_app(
 
     // Reserve capacity before dispatch. A denial means the model is never
     // called.
-    let reservation = store::reserve(&state.pool, company_id, estimate_tokens(&body.description))
+    // Monetary reservation before dispatch: the price is versioned
+    // configuration looked up by provider/model, never request input, and an
+    // unconfigured price stays unknown (cost_upper_bound refuses to guess).
+    let estimate = estimate_tokens(&body.description);
+    let price = state.pricing.get(&body.provider, &body.model).cloned();
+    let cost_estimate = price
+        .as_ref()
+        .and_then(|p| businex_models::pricing::cost_upper_bound(p, estimate));
+    let reservation = store::reserve(&state.pool, company_id, estimate, cost_estimate)
         .await
         .map_err(store_err)?;
     let outcome = match state
@@ -467,6 +475,7 @@ async fn generate_app(
             model: body.model.clone(),
             api_key,
             endpoint,
+            price,
             description: body.description.clone(),
         })
         .await
