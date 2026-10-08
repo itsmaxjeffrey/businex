@@ -409,6 +409,82 @@ async fn app_management_requires_admin_and_stays_inside_the_tenant() {
     let _ = owner_addr;
 }
 
+// Version publishing is serialized per app: two concurrent publishes both
+// succeed with distinct consecutive version numbers instead of racing on
+// max(version) + 1. All writes run through begin_company_tx, which pins
+// SET LOCAL ROLE businex_app - the restricted application role.
+#[tokio::test]
+async fn concurrent_publishes_serialize_version_numbers() {
+    let (_db, state) = test_state().await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let apps = format!("/api/companies/{}/apps", company);
+    let (status, body) = owner.post(&apps, json!({"manifest": manifest_v1()})).await;
+    assert_eq!(status, StatusCode::OK, "{}", body);
+    let app_id = body["id"].as_str().expect("app id").to_string();
+    let versions = format!("{}/{}/versions", apps, app_id);
+
+    let mut first = Client::new(owner.app.clone());
+    first.cookie = owner.cookie.clone();
+    let mut second = Client::new(owner.app.clone());
+    second.cookie = owner.cookie.clone();
+    let (a, b) = tokio::join!(
+        first.post(&versions, json!({"manifest": manifest_v2()})),
+        second.post(&versions, json!({"manifest": manifest_v2()}))
+    );
+    assert_eq!(a.0, StatusCode::OK, "{:?}", a.1);
+    assert_eq!(b.0, StatusCode::OK, "{:?}", b.1);
+    let mut numbers = [
+        a.1["version"].as_i64().expect("version a"),
+        b.1["version"].as_i64().expect("version b"),
+    ];
+    numbers.sort_unstable();
+    assert_eq!(numbers, [2, 3], "serialized consecutive versions: {:?}", numbers);
+}
+
+// Generation is an admin action like key management: members and outsiders
+// are refused before anything dispatches.
+#[tokio::test]
+async fn generation_requires_admin_rights() {
+    let fake = Arc::new(FakeGenerator::ok());
+    let (_db, state) = model_test_state(fake.clone()).await;
+    let (mut owner, _addr) = register(router(state.clone()), "owner").await;
+    let company = create_company(&mut owner, "Acme").await;
+    let generate_uri = format!("/api/companies/{}/apps/generate", company);
+    let request_body = json!({"description": "An inventory tracker", "provider": "openai", "model": "test-model"});
+
+    let (mut member, member_addr) = register(router(state.clone()), "member").await;
+    let (status, invite) = owner
+        .post(
+            &format!("/api/companies/{}/invitations", company),
+            json!({"email": member_addr, "role": "member"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{}", invite);
+    let token = invite
+        .get("token")
+        .and_then(|v| v.as_str())
+        .expect("token")
+        .to_string();
+    let (status, _) = member
+        .post("/api/invitations/accept", json!({"token": token}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = member.post(&generate_uri, request_body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+
+    let (mut outsider, _addr) = register(router(state.clone()), "outsider").await;
+    let (status, body) = outsider.post(&generate_uri, request_body.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{}", body);
+
+    assert_eq!(
+        fake.calls.load(Ordering::SeqCst),
+        0,
+        "no dispatch for denied callers"
+    );
+}
+
 // Two writers racing on the same unique value must produce exactly one
 // record: the transaction-scoped lock in ensure_unique serializes the
 // check-and-write so the loser sees the winner's row.

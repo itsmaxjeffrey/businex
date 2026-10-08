@@ -188,6 +188,10 @@ async fn publish_version(
             message: "manifest slug does not match the app".into(),
         }));
     }
+    // Publishing is a version-set transition: hold the exclusive app lock
+    // so concurrent publishes (and publishes racing installs) serialize
+    // instead of both computing the same next version.
+    lock_app_for_transition(&mut tx, company_id, app_id).await?;
     let version: i32 = sqlx::query_as::<_, (i32,)>(
         "SELECT coalesce(max(version), 0) + 1 FROM app_versions WHERE app_id = $1",
     )

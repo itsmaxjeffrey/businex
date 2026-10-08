@@ -11,7 +11,9 @@ mandate is listed with a status and concrete evidence. Status values:
 Model used for this work: xiaomi-token-plan/mimo-v2.6-pro (no substitution). Any fallback will be
 recorded here explicitly.
 
-Last updated: 2026-10-08 (runs 1-43). Run 43 (PM budget review
+Last updated: 2026-10-08 (runs 1-44). Run 44 (consolidated checklist
+recheck + publish serialization): models+api+core 146 passing, 0 failed,
+exit 0 (log /tmp/businex-run44.log). Run 43 (PM budget review
 fixes): models+api+core 144 passing, 0 failed, exit 0
 (log /tmp/businex-run43.log). Run 42 (PM builder review
 fixes): api+core+models 139 passing, 0 failed, exit 0
@@ -178,6 +180,31 @@ a load-sensitive race in the single-flight refresh dedup or its test.
 | G12 | The builder passes None pricing to all adapters, so every production generation has unknown cost; wire configured/versioned model pricing or explicitly enforce unknown-policy | fixed | Both. Versioned pricing is wired end to end: Price records (provider+model keyed, effective date, estimate flag) load from BUSINEX_MODEL_PRICING_FILE through PricingTable (malformed records rejected at startup), GenerateRequest carries the configured price into build_adapter and on to every adapter constructor, and the same lookup computes the conservative pre-dispatch cost bound for reserve. With no configured price the cost stays explicitly unknown and G11's policy is the enforcement (run 43) |
 | G13 | Avoid claiming hard spending limits from the current token-only atomic test; preserve observed usage unknown state separately from the conservative budget charge | fixed | Claims scoped: budget.rs and store.rs docs now state the in-memory ledger is a unit-test helper and that a cap is not a hard spending limit for unknown-cost calls (the deny policy is); tracker T15 carries the same scope. Observed and charged state are separate columns: settled_tokens/settled_cost_micros carry the conservative charge (estimate when nothing was reported) while observed_tokens, unknown_usage_calls, unknown_cost_calls and the nullable model_usage columns record observation. Proof: observed_state_stays_separate_from_the_conservative_charge (run 43) |
 
+## PM consolidated checklist cross-reference (2026-10-08)
+
+Rechecked pm-open-review-20261008.md against current code (not against
+memory). One real gap was found and fixed in run 44; everything else
+maps to existing evidence. The checklist supplements, never narrows, the
+full brief.
+
+| Checklist item | Status | Evidence |
+| --- | --- | --- |
+| Concurrent creates/updates cannot duplicate a unique field; prove with simultaneous requests under the restricted application DB role | fixed | G1 lock + simultaneous_unique_writers_admit_exactly_one_record; the two racing requests run through begin_company_tx which pins SET LOCAL ROLE businex_app, so the proof is under the restricted role (run 40) |
+| Serialize version publishing/install transitions; validate retained data before upgrade/rollback; failed compatibility preserves installed version and records atomically | fixed | Install/upgrade/rollback hold the exclusive per-app lock and validate retained records first (G2). Publishing was the gap: max(version)+1 was unlocked. publish_version now takes lock_app_for_transition before the version read. Proofs: concurrent_publishes_serialize_version_numbers (versions 2 and 3, no duplicate-version conflict) and version_switches_refuse_changes_that_invalidate_retained_records (refused switch leaves install and records untouched) (run 44) |
+| Record deletion after uninstall fails consistently with other CRUD | fixed | G3: deleting_records_requires_a_live_install (run 40) |
+| Warehouse/member vs manager enforced per entity/action, not merely company permissions | fixed | G4: entity_action_rules_narrow_writes_by_role (run 40) |
+| Generation callers cannot override destination for stored secrets; endpoint bound to admin key config; redirects/outbound validated; trusted local endpoints supported | fixed | G6: generation_cannot_redirect_a_key_to_an_unauthorized_endpoint; endpoint stored under ModelKeysManage, urlpolicy-validated (https or explicit loopback), adapter client never follows redirects (run 42) |
+| Malicious endpoint override tested without transmitting any real secret | fixed | Same proof: the refused request dispatches nothing (zero generator calls) and the key never leaves storage; test fixtures use dummy strings (run 42) |
+| Generator wired into API/state, compiled, failures and access denials tested | fixed | routes_models merged in the router and compiled; failures: a_pre_dispatch_failure_releases_its_reservation, an_ambiguous_failure_is_charged_and_recorded_for_reconciliation, unusable_model_output_is_charged_and_refused; access denials: model_keys_require_admin_rights and generation_requires_admin_rights (member + outsider 403, zero dispatch) (run 44) |
+| Durable generation jobs survive client disconnect and worker restart; kind=code is not executable custom TypeScript | open | Next milestone. The synchronous generator is honest about its scope; businex-builder proves isolated TS compile/typecheck/execute at the builder level (run 41) but durable generation jobs and the installed-app runtime are not built yet. Tracked in T11/W2/A2/A3 |
+| Budget: bounded input incl. system prompt + max output reserved pre-dispatch | fixed | G7: estimate_covers_the_whole_request_and_output (run 42) |
+| Budget: monetary capacity reserved atomically for priced calls; concurrent callers cannot overspend | fixed | G10: concurrent_priced_reservations_cannot_exceed_the_cost_cap (run 43) |
+| deny_when_cost_unknown independent of max_cost_micros | fixed | G11 (run 43) |
+| Configure/version pricing when known; explicit unknown when absent | fixed | G12: versioned Price records via BUSINEX_MODEL_PRICING_FILE, threaded to adapters; absent price stays unknown (run 43) |
+| Timeout after dispatch is an uncertain external outcome: persist for reconciliation, no blind replay or immediate release | fixed | G8: settle_ambiguous charges the estimate and marks model_usage.outcome = 'ambiguous'; double settle/release refused (run 42) |
+| Checked arithmetic; unknown observed usage kept separate from conservative charges | fixed | G13: Overflow fails closed; observed_tokens/unknown counters separate from settled totals (run 43) |
+| Closed review items (e2e runner build, token display, timing honesty) | closed | E1/E2/E5/E6/E7; independently confirmed by the PM |
+
 ## Browser e2e milestone (2026-10-08)
 
 | ID | Item | Status | Evidence |
@@ -192,7 +219,7 @@ a load-sensitive race in the single-flight refresh dedup or its test.
 
 Per-document-load numbers recorded inside the browser runs (run 39): desktop cold-register load 89ms / DCL 84ms / FCP 252ms, warm-home load 56ms / DCL 45ms / FCP 128ms; mobile cold-register load 88ms / DCL 83ms / FCP 204ms, warm-home load 38ms / DCL 37ms / FCP 92ms. These are synthetic local-lab document-load timings measured by the harness against vite preview on loopback — not real-user metrics such as LCP or INP, and never to be quoted as such.
 
-Run evidence: /tmp/businex-run43.log (models+api+core 144/0, exit 0), /tmp/businex-run42.log (api+core+models 139/0, exit 0), /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
+Run evidence: /tmp/businex-run44.log (models+api+core 146/0, exit 0), /tmp/businex-run43.log (models+api+core 144/0, exit 0), /tmp/businex-run42.log (api+core+models 139/0, exit 0), /tmp/businex-run41.log (builder 14/14, exit 0), /tmp/businex-run40.log (api+core+models 136/0, exit 0), /tmp/businex-e2e-run39.log (4 passed), /tmp/businex-e2e-run.log (run 37, 4 passed), /tmp/businex-workspace-run38.log (157/157), /tmp/businex-web-test-run.log (25/25).
 
 ## Known gates and limitations
 
